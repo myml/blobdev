@@ -917,3 +917,69 @@ fn a_single_missing_object_does_not_flip_the_key_spelling() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A volume written before the `u` prefix must still open and read.
+///
+/// Those objects are stored as `c/<uid>`. Opening such a volume has to notice
+/// that and keep using that spelling; getting it wrong turns an upgrade into
+/// a volume that reads back as zeros.
+#[test]
+fn a_volume_written_before_the_prefix_still_reads() {
+    let root = std::env::temp_dir().join(format!("blobdev-legacy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
+    let n = (obj_blocks * 4) as usize;
+    let mut data = vec![0u8; n * BLOCK as usize];
+    for b in 0..n {
+        data[b * BLOCK as usize..(b + 1) * BLOCK as usize].fill((b % 251) as u8);
+    }
+
+    {
+        let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, n, &data).unwrap();
+        v.flush().unwrap();
+    }
+
+    // Turn the objects into the old spelling.
+    let chunk_dir = objects.join("vol").join("c");
+    let keys: Vec<std::path::PathBuf> = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    for k in keys {
+        let name = k.file_name().unwrap().to_string_lossy().to_string();
+        if let Some(uid) = name.strip_prefix('u') {
+            std::fs::rename(&k, chunk_dir.join(uid)).unwrap();
+        }
+    }
+
+    let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    let mut got = vec![0u8; data.len()];
+    v.read(0, n, &mut got).unwrap();
+    assert_eq!(
+        &got[..],
+        &data[..],
+        "a volume stored under the pre-prefix spelling did not read back"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

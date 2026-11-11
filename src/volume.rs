@@ -1034,7 +1034,10 @@ impl Volume {
         self.complete_working_copy(id)?;
         let uid = self.next_uid;
         self.next_uid = self.next_uid.wrapping_add(1).max(1);
-        let new_key = self.layout.chunk_key(uid);
+        // Write in whatever spelling this volume already uses: mixing them
+        // leaves a volume where some objects are `u<uid>` and some are
+        // `<uid>`, and the next open has to guess.
+        let new_key = self.existing_uid_key(uid);
         let sent = {
             let w = self.working.get(&id).unwrap();
             self.data.put(&new_key, &w.data)?;
@@ -1056,7 +1059,7 @@ impl Volume {
             self.garbage.push(if old == 0 {
                 self.layout.legacy_chunk_key(id)
             } else {
-                self.layout.chunk_key(old)
+                self.existing_uid_key(old)
             });
         }
         self.sent_chunks += 1;
@@ -1280,7 +1283,7 @@ impl Volume {
         let live: std::collections::BTreeSet<String> = self
             .uids
             .values()
-            .map(|uid| self.layout.chunk_key(*uid))
+            .map(|uid| self.existing_uid_key(*uid))
             .collect();
 
         let listing = self.data.list(&prefix)?;

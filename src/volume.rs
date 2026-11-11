@@ -126,9 +126,13 @@ pub struct Fetcher {
 
 impl Fetcher {
     fn object_key(&self, id: u64) -> String {
+        // uid 0 means "patched in place, the key is the object index". It must
+        // not be treated as a real uid: chunk_key(0) and the index key of
+        // object 0 are the same string, so every other object would resolve to
+        // object 0's bytes.
         match self.uids.get(&id) {
-            Some(uid) => self.layout.chunk_key(*uid),
-            None => self.layout.legacy_chunk_key(id),
+            Some(uid) if *uid != 0 => self.layout.chunk_key(*uid),
+            _ => self.layout.legacy_chunk_key(id),
         }
     }
 
@@ -694,9 +698,6 @@ impl Volume {
     /// fetched, so it wins: caching the fetched bytes would resurrect the
     /// previous contents of a chunk that has just been written.
     pub fn apply_fetch(&mut self, req: &FetchRequest, data: Vec<u8>) {
-        if self.working.contains_key(&req.chunk) {
-            return;
-        }
         if !req.whole {
             self.partial_reads += 1;
             return;
@@ -896,6 +897,15 @@ impl Volume {
             }
             let w = self.working.remove(&id).unwrap();
             self.cache_uploaded(id, w.data);
+            // Record that this object is durable. Without an entry here the
+            // metadata would claim the volume is empty, and a restart would
+            // serve zeros over data that is sitting in the store.
+            //
+            // The key is the object index rather than a fresh uid: patched
+            // objects are updated in place, so nothing is superseded. uid 0
+            // is reserved to mean "legacy, key is the object index", which is
+            // exactly this case.
+            self.uids.entry(id).or_insert(0);
             self.save_meta()?;
             self.sent_chunks += 1;
             self.sent_bytes += sent;

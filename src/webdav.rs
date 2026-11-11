@@ -339,6 +339,12 @@ pub struct WebDavStore {
     base: String,
     auth: Option<String>,
     agent: ureq::Agent,
+    /// Set once a server proves it replaces the whole object on a ranged PUT.
+    ///
+    /// Retrying a known-bad ranged write only wastes a round trip and a HEAD,
+    /// so the store remembers and reports `partial_write = false` from then
+    /// on; the volume then uploads whole objects directly.
+    no_ranged_write: std::sync::atomic::AtomicBool,
 }
 
 impl WebDavStore {
@@ -368,6 +374,7 @@ impl WebDavStore {
             base,
             auth,
             agent: config.into(),
+            no_ranged_write: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -607,7 +614,26 @@ impl WebDavStore {
             Some(data),
         )?;
         match reply.status {
-            200 | 201 | 204 => Ok(()),
+            200 | 201 | 204 => {
+                // A server that accepts Content-Range but ignores it replaces
+                // the whole object with this patch, silently truncating it to
+                // the patched range. The status says success, so only the
+                // resulting length gives it away. Treat a shortened object as
+                // a failed patch: the volume then re-uploads the whole object.
+                if let Some((len, _)) = self.head(key)? {
+                    if len != total {
+                        self.no_ranged_write
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        anyhow::bail!(
+                            "ranged PUT {url}: object is {len} bytes after patching {}..{}, \
+                             expected {total}; this server does not honour Content-Range",
+                            offset,
+                            offset + data.len() as u64
+                        );
+                    }
+                }
+                Ok(())
+            }
             // 400/405/501: the server will not do ranged writes. The volume
             // layer reacts to a *failed* patch by re-uploading the whole
             // object, so this must be an error, not a silent success.

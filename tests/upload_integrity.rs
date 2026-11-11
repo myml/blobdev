@@ -425,3 +425,126 @@ fn rewrite_after_upload_keeps_cached_bytes() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A restart must see the data a partial-write backend uploaded.
+///
+/// The patched path updates objects in place and used to leave no entry in
+/// the metadata, so the saved state claimed the volume was empty. Everything
+/// read back as zeros afterwards even though the objects were intact.
+#[test]
+fn restart_sees_objects_uploaded_by_a_partial_write_backend() {
+    let root = std::env::temp_dir().join(format!("blobdev-pwm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = 4 * DEFAULT_CHUNK;
+    let data = pattern(2000);
+
+    {
+        let store = Arc::new(DirStore::new(&objects).unwrap());
+        assert!(store.caps().partial_write, "test needs the patched path");
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(size)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, 2000, &data).unwrap();
+        v.flush().unwrap();
+    }
+
+    // A fresh process must still know those objects exist.
+    let store = Arc::new(DirStore::new(&objects).unwrap());
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    let mut got = vec![0u8; data.len()];
+    v.read(0, 2000, &mut got).unwrap();
+    let mut bad = Vec::new();
+    for b in 0..2000u64 {
+        let off = (b * BLOCK) as usize;
+        if got[off..off + BLOCK as usize] != data[off..off + BLOCK as usize] {
+            bad.push((b, got[off], data[off]));
+            if bad.len() >= 3 {
+                break;
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "a restart lost data the patched path had uploaded: (idx, got, want) {bad:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+
+/// Objects patched in place are keyed by index, and that must not collide
+/// with a real uid of 0.
+///
+/// `chunk_key(0)` and the index key of object 0 are the same string. Treating
+/// the "patched in place" marker as a real uid made every object resolve to
+/// object 0's bytes, so a volume read back the first 4 MiB over and over.
+#[test]
+fn patched_objects_do_not_alias_object_zero() {
+    let root = std::env::temp_dir().join(format!("blobdev-alias-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = 4 * DEFAULT_CHUNK;
+    let obj_blocks = (blobdev::volume::DEFAULT_OBJECT / BLOCK) as u64;
+    let n = (obj_blocks * 3) as usize;
+    // Each block carries its own index, so a shifted read is obvious.
+    let mut data = vec![0u8; n * BLOCK as usize];
+    for b in 0..n {
+        data[b * BLOCK as usize..(b + 1) * BLOCK as usize].fill((b % 251) as u8);
+    }
+
+    {
+        let store = Arc::new(DirStore::new(&objects).unwrap());
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(size)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, n, &data).unwrap();
+        v.flush().unwrap();
+    }
+
+    let store = Arc::new(DirStore::new(&objects).unwrap());
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    let mut got = vec![0u8; data.len()];
+    v.read(0, n, &mut got).unwrap();
+    let mut bad = Vec::new();
+    for b in 0..n {
+        if got[b * BLOCK as usize] != (b % 251) as u8 {
+            bad.push((b, got[b * BLOCK as usize], (b % 251) as u8));
+            if bad.len() >= 3 {
+                break;
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "read back the wrong object's bytes: (block, got, want) {bad:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

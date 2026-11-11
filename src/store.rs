@@ -476,6 +476,10 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
             || msg.contains("broken pipe")
             || msg.contains("connection reset")
             || msg.contains("unexpected eof")
+            // ureq reports a connection that died before a reply as this.
+            || msg.contains("peer disconnected")
+            || msg.contains("peer closed")
+            || msg.contains("connection closed")
     })
 }
 
@@ -638,5 +642,21 @@ mod transient_tests {
         // A request the server rejected as wrong will not improve.
         let e = anyhow::Error::new(Error::from(ErrorKind::InvalidInput));
         assert!(!err_of(e));
+    }
+
+    /// The HTTP client has its own words for a vanished peer.
+    ///
+    /// ureq says "Peer disconnected" rather than raising an io error with a
+    /// kind, so matching on ErrorKind alone left those failures final.
+    #[test]
+    fn the_clients_own_disconnect_wording_is_retried() {
+        for msg in [
+            "io: Peer disconnected",
+            "Peer closed connection without sending TLS close_notify",
+            "connection closed before message completed",
+        ] {
+            let e = anyhow::anyhow!("{msg}");
+            assert!(err_of(e), "{msg:?} should be retried");
+        }
     }
 }

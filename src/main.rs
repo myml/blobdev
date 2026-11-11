@@ -241,9 +241,11 @@ fn run(args: &[String]) -> Result<()> {
     };
 
     let store = build_store(args)?;
+    // Locked: two daemons on one volume would silently overwrite each other's
+    // metadata. One-shot commands below deliberately do not lock.
     let volume = Volume::open_with_cache(
         store,
-        Box::new(FileMeta::new(&meta_path)),
+        Box::new(FileMeta::locked(&meta_path)?),
         Layout::new(&volume_name),
         create,
         policy,

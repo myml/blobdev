@@ -790,6 +790,26 @@ impl Volume {
         }
 
         if self.caps.partial_write {
+            // Patching needs a base object. If there is none, or if this write
+            // covers most of the chunk, the whole object has to be written --
+            // and a whole-object write must not publish zeros for blocks this
+            // write never touched, so fill them in from the store first.
+            let needs_full_put = {
+                let key = match self.uids.get(&id) {
+                    Some(uid) => self.layout.chunk_key(*uid),
+                    None => self.layout.legacy_chunk_key(id),
+                };
+                let w = self.working.get(&id).unwrap();
+                let nearly_all = w.dirty.len() as u64 * BLOCK * 100
+                    >= (w.data.len() as u64).max(1) * 90;
+                self.data.stat(&key)?.is_none() || nearly_all
+            };
+            // Either way the bytes come from the working copy, so every block
+            // being written has to be present. A partial copy only holds the
+            // blocks this session wrote; the rest must come from the store.
+            if needs_full_put || self.needs_completion(id) {
+                self.complete_working_copy(id)?;
+            }
             let key = match self.uids.get(&id) {
                 Some(uid) => self.layout.chunk_key(*uid),
                 None => self.layout.legacy_chunk_key(id),
@@ -854,6 +874,17 @@ impl Volume {
 
     /// Fill in blocks of a partial working copy that have never been read, so a
     /// whole-object upload does not write zeros over them.
+    /// Whether the working copy is missing blocks it must fill in.
+    fn needs_completion(&self, id: u64) -> bool {
+        match self.working.get(&id) {
+            Some(w) => {
+                let blocks = w.data.len().div_ceil(BLOCK as usize) as u64;
+                (0..blocks).any(|b| !w.known.contains(&b))
+            }
+            None => false,
+        }
+    }
+
     fn complete_working_copy(&mut self, id: u64) -> Result<()> {
         let Some(w) = self.working.get(&id) else {
             return Ok(());

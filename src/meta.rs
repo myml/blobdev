@@ -234,11 +234,44 @@ impl MetaStore for MemMeta {
 /// the chunk blocks that still need uploading.
 pub struct FileMeta {
     path: std::path::PathBuf,
+    /// Held for the lifetime of the volume so two processes cannot both
+    /// believe they own it. Never read: dropping it releases the lock.
+    #[allow(dead_code)]
+    lock: Option<crate::lockfile::FileLock>,
 }
 
 impl FileMeta {
+    /// Metadata in `path`, without taking the exclusive lock.
+    ///
+    /// Used by one-shot commands (`gc`, `inspect`) that must be able to run
+    /// while nothing else owns the volume; the daemon path uses
+    /// [`FileMeta::locked`].
     pub fn new(path: impl Into<std::path::PathBuf>) -> FileMeta {
-        FileMeta { path: path.into() }
+        FileMeta {
+            path: path.into(),
+            lock: None,
+        }
+    }
+
+    /// Metadata in `path`, taking an exclusive lock on `<path>.lock`.
+    ///
+    /// Two `blobdev run` processes against one volume would each write their
+    /// own metadata and their own chunk objects, and the last writer would
+    /// silently discard the other's work.
+    pub fn locked(path: impl Into<std::path::PathBuf>) -> Result<FileMeta> {
+        let path = path.into();
+        let lock_path = path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        let lock = crate::lockfile::FileLock::try_acquire(&lock_path)
+            .with_context(|| format!("lock volume metadata {}", path.display()))?;
+        Ok(FileMeta {
+            path,
+            lock: Some(lock),
+        })
     }
 
     pub fn path(&self) -> &Path {

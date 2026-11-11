@@ -1,0 +1,33 @@
+# /etc/blobdev/<volume>.conf
+#
+# Settings for the systemd unit blobdev@<volume>.  Passed verbatim to
+# `blobdev run`, so keep all flags on this one line.
+#
+# The credentials below are visible to root only; protect the file with
+#   chown root:root /etc/blobdev/<volume>.conf && chmod 0600
+#
+# S3 example (path-style is required by RustFS and MinIO):
+BLOBDEV_ARGS="--backend s3 \
+  --endpoint http://127.0.0.1:9000 \
+  --bucket blobs \
+  --access-key BLOBDEV \
+  --secret-key CHANGEME \
+  --path-style \
+  --volume data \
+  --meta /var/lib/blobdev/data.meta \
+  --cache-dir /var/cache/blobdev \
+  --cache-size 50G"
+
+# WebDAV example:
+#BLOBDEV_ARGS="--backend webdav \
+#  --endpoint https://dav.example.com/files \
+#  --user blobdev --password CHANGEME \
+#  --volume data \
+#  --meta /var/lib/blobdev/data.meta \
+#  --cache-dir /var/cache/blobdev"
+
+# Local directory example (useful to try it out without any server):
+#BLOBDEV_ARGS="--backend dir --dir /var/lib/blobdev/objects \
+#  --volume data \
+#  --create-size 10G \
+#  --meta /var/lib/blobdev/data.meta"

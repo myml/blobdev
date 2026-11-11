@@ -704,3 +704,50 @@ fn gc_refuses_when_metadata_references_a_missing_object() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The partial-write path must not publish zeros either.
+///
+/// When the base object does not exist yet, the backend needs a whole-object
+/// PUT. Doing that from a partial working copy would write zeros over every
+/// block this write never touched, which is exactly how an ext4 filesystem
+/// ended up unreadable right after mkfs.
+#[test]
+fn partial_write_backend_creates_missing_object_without_losing_blocks() {
+    let root = tmpdir("pwcreate");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = DEFAULT_CHUNK;
+    let store = Arc::new(DirStore::new(&objects).unwrap());
+    assert!(store.caps().partial_write);
+
+    let mut v = Volume::open(
+        store as Arc<dyn ObjectStore>,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        Some(Create::new(size)),
+        Policy::default(),
+    )
+    .unwrap();
+
+    // Several separate writes inside one chunk, each flush creating the object
+    // for the first time from a partial working copy.
+    v.write(1, 1, &blocks(1, 0xA1)).unwrap();
+    v.flush().unwrap();
+    v.write(3, 1, &blocks(1, 0xB2)).unwrap();
+    v.flush().unwrap();
+    v.write(500, 1, &blocks(1, 0xC3)).unwrap();
+    v.flush().unwrap();
+
+    // Everything written must read back, and everything else must read zero
+    // rather than garbage or earlier data.
+    let mut buf = vec![0u8; BLOCK as usize];
+    for (blk, want) in [(1u64, 0xA1u8), (3, 0xB2), (500, 0xC3)] {
+        v.read(blk, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], want, "block {blk} was lost");
+    }
+    for blk in [2u64, 4, 499] {
+        v.read(blk, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], 0, "block {blk} should be zero");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

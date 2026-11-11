@@ -123,7 +123,16 @@ blobdev run --backend webdav --endpoint https://dav.example.com/files \
 
 blobdev stop   --id 0     # 卸载设备
 blobdev status            # 列出 ublk 设备
+blobdev inspect --volume vol1 ...   # 校验元数据与实际对象是否一致
+blobdev ls      --volume vol1 ...   # 列出 chunk 对象
+blobdev gc      --volume vol1 ...   # 回收无引用的孤儿对象（先加 --dry-run 看）
 ```
+
+`inspect` 会逐个检查元数据引用的对象是否真的存在；`gc` 只删除没有任何引用的对象，
+并且在发现引用缺失时会拒绝执行（那时卷已经不一致，删掉剩余对象只会让情况更糟）。
+
+**一个卷只允许一个进程**：`run` 会在元数据旁加 `.lock` 文件独占锁，
+第二个实例会直接报错退出，而不是两个进程互相覆盖元数据。
 
 `--create-size` 只在卷不存在时生效，之后从元数据读几何信息。
 
@@ -135,6 +144,19 @@ mount /dev/ublkb0 /mnt
 cp bigfile /mnt/
 umount /mnt          # 触发 flush，所有脏 chunk 上传
 ```
+
+## 运维
+
+systemd 单元与安装说明见 [`packaging/INSTALL.md`](packaging/INSTALL.md)：
+
+```bash
+install -m 0755 target/release/blobdev /usr/local/bin/blobdev
+install -m 0644 packaging/blobdev@.service /etc/systemd/system/
+cp packaging/blobdev.conf.example /etc/blobdev/data.conf   # 填后端与密钥
+systemctl enable --now blobdev@data
+```
+
+`SIGTERM` 会先把所有脏 chunk 上传完再退出，`TimeoutStopSec=300` 给足时间。
 
 ## 一致性
 
@@ -166,6 +188,9 @@ scripts/webdav_server.py DIR    # 本地 WebDAV 测试服务端（纯标准库�
 |---|---|
 | 目录后端：写 120 MiB → flush → 重启重读 | 通过，22 个 chunk 对象，sha256 一致 |
 | S3：改一个块 → 旧对象消失、新 uid 出现、总数不变 | 通过，0 错误 |
+| S3：写 48 MiB 后重启（drop 页缓存） | 通过，13 个 chunk 直接来自本地缓存 |
+| S3：`gc` 识别并删除孤儿，不误删引用中的对象 | 通过（5 引用保留、2 孤儿删除） |
+| 两个进程抢同一卷 | 通过，第二个被拒绝并提示持有者 PID |
 | WebDAV：写 40 MiB → flush → 重启重读 | 通过，sha256 一致 |
 | S3（RustFS）：写 80 MiB → flush → 重启重读 | 通过，sha256 一致，0 错误 |
 | S3：写 512 MiB（4 个文件）→ 重启重读 | 通过，写入耗时 2 秒（不等待上传） |
@@ -183,7 +208,8 @@ scripts/webdav_server.py DIR    # 本地 WebDAV 测试服务端（纯标准库�
 2. **S3 写放大 2048×**：改一个 4 KiB 块要传 8 MiB。减小 chunk 能减轻，
    但会增加请求数；没有银弹。
 3. **磁盘缓存不做跨卷/跨进程共享**：每个卷一个目录，多进程同时用同一卷会互相干扰。
-4. **单队列、同步 IO**：正确性优先，不是吞吐最优形态。
+4. **同步 IO**：读/写在队列线程里同步完成。慢后端会占用队列线程（但不占锁），
+   高并发场景下吞吐受队列数限制（`--queues`）。
 5. **`discard` 是空操作**：chunk 整体替换时空间自然回收。
 
 ## License

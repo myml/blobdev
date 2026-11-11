@@ -479,7 +479,7 @@ fn status(_args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<6} {:<16} {:<14} {}", "ID", "BLOCK NODE", "MOUNTED AT", "DAEMON");
+    println!("{:<6} {:<16} {:<14} DAEMON", "ID", "BLOCK NODE", "MOUNTED AT");
     for id in ids {
         let node = format!("/dev/ublkb{id}");
         let node_exists = std::path::Path::new(&node).exists();

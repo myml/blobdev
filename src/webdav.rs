@@ -559,7 +559,7 @@ impl WebDavStore {
                 log::debug!("MKCOL {url} unsupported (501); relying on PUT to create it");
                 Ok(())
             }
-            _ => return Err(reply.error(&format!("MKCOL {url}"))),
+            _ => Err(reply.error(&format!("MKCOL {url}"))),
         }
     }
 
@@ -582,7 +582,7 @@ impl WebDavStore {
             // 405/501: no PROPFIND support. Trust the MKCOL answer rather than
             // inventing a failure the caller cannot act on.
             405 | 501 => Ok(true),
-            _ => return Err(reply.error(&format!("PROPFIND {target}"))),
+            _ => Err(reply.error(&format!("PROPFIND {target}"))),
         }
     }
 
@@ -613,7 +613,7 @@ impl WebDavStore {
             400..=499 if !matches!(reply.status, 401 | 403 | 407 | 408 | 409 | 429) => {
                 self.propfind_size(key)
             }
-            _ => return Err(reply.error(&format!("HEAD {url}"))),
+            _ => Err(reply.error(&format!("HEAD {url}"))),
         }
     }
 
@@ -646,7 +646,7 @@ impl WebDavStore {
             // Servers without PROPFIND (plain file servers sometimes answer
             // 405) cannot report a size; ask for the data instead.
             405 | 501 => Ok(Some((self.measure_by_get(key)?, None))),
-            _ => return Err(reply.error(&format!("PROPFIND {url}"))),
+            _ => Err(reply.error(&format!("PROPFIND {url}"))),
         }
     }
 
@@ -669,7 +669,7 @@ impl WebDavStore {
             200 | 206 => Ok(reply.body),
             404 | 410 => Ok(Vec::new()),
             416 => anyhow::bail!("GET {url}: range not satisfiable"),
-            _ => return Err(reply.error(&format!("GET {url}"))),
+            _ => Err(reply.error(&format!("GET {url}"))),
         }
     }
 
@@ -707,10 +707,10 @@ impl WebDavStore {
                 )?;
                 match reply.status {
                     200 | 201 | 204 => Ok(reply.etag()),
-                    _ => return Err(reply.error(&format!("PUT {url}"))),
+                    _ => Err(reply.error(&format!("PUT {url}"))),
                 }
             }
-            _ => return Err(reply.error(&format!("PUT {url}"))),
+            _ => Err(reply.error(&format!("PUT {url}"))),
         }
     }
 
@@ -772,7 +772,7 @@ impl WebDavStore {
                 "ranged PUT {url}: {} (content-range {cr}, object is {total} bytes)",
                 reply.describe()
             ),
-            _ => return Err(reply.error(&format!("ranged PUT {url}"))),
+            _ => Err(reply.error(&format!("ranged PUT {url}"))),
         }
     }
 }

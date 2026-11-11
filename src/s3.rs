@@ -471,6 +471,23 @@ impl S3Store {
         Ok((uri, self.authority()))
     }
 
+    /// URI and `Host` for the bucket-level probe.
+    ///
+    /// The bucket itself, not the prefix: `target("")` appends the prefix when
+    /// one is configured, which would list a nonexistent object. The URI keeps
+    /// exactly one trailing `/`, the spelling S3 expects for a bucket listing.
+    fn probe_target(&self) -> (String, String) {
+        let (uri, host) = self
+            .target_at("", false)
+            .unwrap_or_else(|_| ("/".to_string(), self.authority()));
+        let uri = if uri.ends_with('/') {
+            uri
+        } else {
+            format!("{uri}/")
+        };
+        (uri, host)
+    }
+
     fn now_amz_date() -> Result<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -789,10 +806,7 @@ impl S3Store {
     }
 
     pub fn check_bucket(&self) -> Result<()> {
-        // The bucket itself, not the prefix: `target("")` appends the prefix
-        // when one is configured, which would list a nonexistent object.
-        let (uri, host) = self.target_at("", false)?;
-        let uri = format!("{uri}/");
+        let (uri, host) = self.probe_target();
         let headers = vec![("host".to_string(), host)];
         let now = Self::now_amz_date()?;
         let signed = sign(
@@ -807,12 +821,28 @@ impl S3Store {
         let reply = self.send(&signed, &[])?;
         match reply.status {
             200 => {
-                anyhow::ensure!(
-                    String::from_utf8_lossy(&reply.body).contains("<ListBucketResult"),
-                    "GET {}?list-type=2: unexpected listing body",
-                    uri
+                let body = String::from_utf8_lossy(&reply.body);
+                if body.contains("<ListBucketResult") {
+                    return Ok(());
+                }
+                // A server that answers with a *bucket list* did not see a
+                // bucket in this request: under virtual-host addressing that
+                // means it ignores the bucket in the Host header, which is
+                // common for self-hosted implementations.
+                if body.contains("<ListAllMyBucketsResult") {
+                    anyhow::bail!(
+                        "endpoint answered with a bucket list instead of a listing of {:?}: \
+                         it does not resolve the bucket from the Host header, so \
+                         --virtual-host-style cannot be used here; drop the flag to use \
+                         path-style addressing",
+                        self.cfg.bucket
+                    );
+                }
+                anyhow::bail!(
+                    "GET {}?list-type=2: unexpected listing body: {}",
+                    uri,
+                    body.chars().take(200).collect::<String>(),
                 );
-                Ok(())
             }
             301 | 307 | 308 => anyhow::bail!("{}", self.explain_redirect(&reply)),
             404 => {
@@ -1257,13 +1287,30 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         .unwrap();
         assert_eq!(s.target("").unwrap().0, "/blobtest/livecheck/x");
         assert_eq!(s.target_at("", false).unwrap().0, "/blobtest");
-        // The probe URL is that root plus one `/`, which is the spelling
-        // RustFS (and S3) accept for a bucket-level listing.
-        let (uri, host) = s.target_at("", false).unwrap();
-        let url = format!("{}://{}{}/", s.ep.scheme, s.authority(), uri);
+        // The probe URL is that root plus exactly one `/`, which is the
+        // spelling RustFS (and S3) accept for a bucket-level listing.
+        let (uri, host) = s.probe_target();
+        let url = format!("{}://{}{}", s.ep.scheme, s.authority(), uri);
         let parsed: ureq::http::Uri = url.parse().expect(&url);
         assert_eq!(parsed.path(), "/blobtest/");
         assert_eq!(parsed.authority().unwrap().as_str(), host);
+    }
+
+    /// Regression: the bucket probe appended `/` to a URI that already ended
+    /// in one, producing `//`. Path-style servers tolerated it; virtual-host
+    /// addressing rejected the signature because no S3 signs `//` that way.
+    #[test]
+    fn bucket_probe_does_not_double_the_slash_in_virtual_host_style() {
+        let s = S3Store::new(
+            S3Config::new("http://h:9000", "r", "blobtest", "k", "s").with_path_style(false),
+        )
+        .unwrap();
+        let (uri, host) = s.probe_target();
+        let url = format!("{}://{}{}", s.ep.scheme, s.authority(), uri);
+        let parsed: ureq::http::Uri = url.parse().expect(&url);
+        assert_eq!(parsed.path(), "/", "virtual-host probe must be `/`");
+        assert_eq!(parsed.authority().unwrap().as_str(), "blobtest.h:9000");
+        assert_eq!(host, "blobtest.h:9000");
     }
 
     #[test]

@@ -36,8 +36,12 @@ fn usage() -> ! {
 backends:
   --backend dir     --dir PATH
   --backend s3      --endpoint URL --bucket NAME --access-key K --secret-key S
-                    [--region R] [--path-style] [--key-prefix P]
+                    [--region R] [--path-style | --virtual-host-style] [--key-prefix P]
   --backend webdav  --endpoint URL [--user U] [--password P] [--key-prefix P]
+
+s3 addressing:
+  --path-style           bucket in the path (default; MinIO, RustFS)
+  --virtual-host-style   bucket in the host (AWS, wildcard DNS)
 
 options:
   --meta PATH        metadata file (default: ./<volume>.meta)
@@ -132,8 +136,12 @@ fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
             if let Some(p) = arg(args, "--key-prefix") {
                 cfg = cfg.with_prefix(p);
             }
-            // MinIO/RustFS and most self-hosted endpoints need path-style.
-            if flag(args, "--path-style") {
+            // Self-hosted endpoints (MinIO, RustFS) need path-style, which is
+            // the default because it never depends on wildcard DNS. AWS and
+            // other wildcard-DNS deployments want --virtual-host-style.
+            if flag(args, "--virtual-host-style") {
+                cfg = cfg.with_path_style(false);
+            } else if flag(args, "--path-style") {
                 cfg = cfg.with_path_style(true);
             }
             // Session tokens are for temporary credentials; wire them once the

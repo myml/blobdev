@@ -30,14 +30,27 @@ use crate::meta::{ChunkState, Geometry, MetaStore, Snapshot};
 use crate::readcache::ReadCache;
 use crate::store::{Caps, ObjectStore};
 
+/// Smallest addressable unit, matching the block device's logical block.
 pub const BLOCK: u64 = 4096;
-pub const DEFAULT_CHUNK: u64 = 8 << 20;
+
+/// Logical addressing unit, the way JuiceFS uses its chunk: a write is located
+/// by `offset / DEFAULT_CHUNK`, and the chunk never changes size or
+/// boundaries. It is *not* a storage object; see [`DEFAULT_OBJECT`].
+pub const DEFAULT_CHUNK: u64 = 64 << 20;
+
+/// Physical storage unit: one object holds this many bytes.
+///
+/// This is the number that sets the write amplification. Changing 4 KiB of a
+/// chunk rewrites only the object that covers it, so the cost is
+/// `DEFAULT_OBJECT / BLOCK` = 1024, not the whole chunk.
+pub const DEFAULT_OBJECT: u64 = 4 << 20;
 
 /// Parameters used only when creating a new volume.
 #[derive(Debug, Clone, Copy)]
 pub struct Create {
     pub size: u64,
     pub chunk_size: Option<u64>,
+    pub object_size: Option<u64>,
 }
 
 /// Optional on-disk read cache settings.
@@ -61,11 +74,17 @@ impl Create {
         Create {
             size,
             chunk_size: None,
+            object_size: None,
         }
     }
 
     pub fn with_chunk_size(mut self, chunk_size: u64) -> Create {
         self.chunk_size = Some(chunk_size);
+        self
+    }
+
+    pub fn with_object_size(mut self, object_size: u64) -> Create {
+        self.object_size = Some(object_size);
         self
     }
 }
@@ -141,7 +160,7 @@ impl Fetcher {
 
     fn fetch_range(&self, id: u64, start: u64, want: u64) -> Result<Vec<u8>> {
         let key = self.object_key(id);
-        let chunk_len = self.geometry.chunk_len(id);
+        let chunk_len = self.geometry.object_len(id);
         if start >= chunk_len {
             return Ok(vec![0u8; want as usize]);
         }
@@ -236,6 +255,7 @@ impl Layout {
     /// The uid is unique per written object, and an object is never modified
     /// after it is written, so a new version can be uploaded while the old one
     /// is still being served.
+    /// Key of one physical object.
     pub fn chunk_key(&self, uid: u32) -> String {
         format!("{}/c/{}", self.root, uid)
     }
@@ -399,6 +419,7 @@ impl Volume {
                 let size = create.size;
                 let geometry = Geometry {
                     chunk_size: create.chunk_size.unwrap_or(DEFAULT_CHUNK),
+                    object_size: create.object_size.unwrap_or(DEFAULT_OBJECT),
                     size,
                 };
                 geometry.validate()?;
@@ -480,7 +501,7 @@ impl Volume {
                 if st.dirty.is_empty() {
                     continue;
                 }
-                let len = self.geometry.chunk_len(id);
+                let len = self.geometry.object_len(id);
                 let data = self.fetcher().fetch(&FetchRequest {
                     chunk: id,
                     start: 0,
@@ -516,8 +537,15 @@ impl Volume {
         &self.geometry
     }
 
-    fn chunk_of(&self, offset: u64) -> u64 {
-        offset / self.geometry.chunk_size
+    /// Physical object covering a volume offset.
+    fn object_of(&self, offset: u64) -> u64 {
+        self.geometry.locate(offset).0
+    }
+
+    /// Bytes from `offset` to the end of its object.
+    fn room_in_object(&self, offset: u64) -> u64 {
+        let (obj, within) = self.geometry.locate(offset);
+        self.geometry.object_len(obj) - within
     }
 
     /// A fetcher that runs without holding the volume lock.
@@ -577,9 +605,9 @@ impl Volume {
         let mut off = blk * BLOCK;
         let mut done = 0usize;
         while off < end {
-            let id = self.chunk_of(off);
-            let local = (off - id * self.geometry.chunk_size) as usize;
-            let n = ((self.geometry.chunk_len(id) - local as u64).min(end - off)) as usize;
+            let id = self.object_of(off);
+            let local = self.geometry.locate(off).1 as usize;
+            let n = (self.room_in_object(off).min(end - off)) as usize;
 
             // A freshly fetched range wins over anything cached.
             let covering = ranges.iter().find(|(r, _)| {
@@ -600,10 +628,10 @@ impl Volume {
             } else if let Some(d) = self.read_cache.get(id) {
                 d
             } else {
-                anyhow::bail!("chunk {id} missing from cache after planning a read");
+                anyhow::bail!("object {id} missing from cache after planning a read");
             };
             if src.len() < local + n {
-                anyhow::bail!("chunk {id} shorter than expected");
+                anyhow::bail!("object {id} shorter than expected");
             }
             out[done..done + n].copy_from_slice(&src[local..local + n]);
             done += n;
@@ -623,29 +651,29 @@ impl Volume {
         let mut plan = ReadPlan::default();
         let mut off = blk * BLOCK;
         while off < end {
-            let id = self.chunk_of(off);
-            let local = off - id * self.geometry.chunk_size;
-            let n = ((self.geometry.chunk_len(id) - local).min(end - off)) as usize;
+            let id = self.object_of(off);
+            let local = self.geometry.locate(off).1;
+            let n = (self.room_in_object(off).min(end - off)) as usize;
 
             if self.working.contains_key(&id) || self.read_cache.get(id).is_some() {
                 off += n as u64;
                 continue;
             }
-            let chunk_len = self.geometry.chunk_len(id);
-            if let Some(mut c) = self.disk_cache.as_mut().and_then(|dc| dc.get(id, chunk_len)) {
-                if c.len() as u64 != chunk_len {
-                    c.resize(chunk_len as usize, 0);
+            let obj_len = self.geometry.object_len(id);
+            if let Some(mut c) = self.disk_cache.as_mut().and_then(|dc| dc.get(id, obj_len)) {
+                if c.len() as u64 != obj_len {
+                    c.resize(obj_len as usize, 0);
                 }
                 self.read_cache.insert(id, c);
                 off += n as u64;
                 continue;
             }
             if !plan.requests.iter().any(|r: &FetchRequest| r.chunk == id) {
-                let whole = self.should_cache_whole(chunk_len, n as u64);
+                let whole = self.should_cache_whole(obj_len, n as u64);
                 plan.requests.push(FetchRequest {
                     chunk: id,
                     start: if whole { 0 } else { local },
-                    len: if whole { chunk_len } else { n as u64 },
+                    len: if whole { obj_len } else { n as u64 },
                     whole,
                 });
             }
@@ -706,9 +734,9 @@ impl Volume {
         let end = start + want;
         let mut done = 0usize;
         while off < end {
-            let id = self.chunk_of(off);
-            let local = off - id * self.geometry.chunk_size;
-            let n = ((self.geometry.chunk_len(id) - local).min(end - off)) as usize;
+            let id = self.object_of(off);
+            let local = self.geometry.locate(off).1;
+            let n = (self.room_in_object(off).min(end - off)) as usize;
             self.write_into_chunk(id, local, &data[done..done + n])?;
             done += n;
             off += n as u64;
@@ -718,11 +746,34 @@ impl Volume {
 
     fn write_into_chunk(&mut self, id: u64, local: u64, data: &[u8]) -> Result<()> {
         if !self.working.contains_key(&id) {
-            // Start from a partial copy: a 4 KiB write must not pull 8 MiB.
-            // Untouched blocks are fetched only if a whole-object upload needs
-            // them, or when they are read.
-            let len = self.geometry.chunk_len(id);
-            self.working.insert(id, Working::partial(len));
+            // A copy already in memory or on disk is the cheapest possible
+            // base: reuse it instead of starting from nothing, otherwise a
+            // chunk that was just uploaded loses the bytes nobody is
+            // rewriting and the next full upload publishes zeros for them.
+            let len = self.geometry.object_len(id);
+            let cached = {
+                let from_mem = self.read_cache.get(id).cloned();
+                match from_mem {
+                    Some(c) => Some(c),
+                    None => self
+                        .disk_cache
+                        .as_mut()
+                        .and_then(|dc| dc.get(id, len)),
+                }
+            };
+            match cached {
+                Some(mut c) => {
+                    c.resize(len as usize, 0);
+                    c.truncate(len as usize);
+                    self.working.insert(id, Working::full(c));
+                }
+                None => {
+                    // Nothing cached: start partial. A 4 KiB write must not
+                    // pull 4 MiB just to modify it; the untouched blocks are
+                    // fetched only when an upload or a read needs them.
+                    self.working.insert(id, Working::partial(len));
+                }
+            }
             self.read_cache.remove(id);
             if let Some(dc) = self.disk_cache.as_mut() {
                 dc.remove(id);
@@ -897,6 +948,11 @@ impl Volume {
         let Some(w) = self.working.get(&id) else {
             return Ok(());
         };
+        log::debug!(
+            "complete object {id}: known={} of {} blocks",
+            w.known.len(),
+            w.data.len().div_ceil(BLOCK as usize)
+        );
         let blocks = w.data.len().div_ceil(BLOCK as usize) as u64;
         let missing: Vec<u64> = (0..blocks).filter(|b| !w.known.contains(b)).collect();
         if missing.is_empty() {
@@ -921,7 +977,9 @@ impl Volume {
                 len: n,
                 whole: false,
             };
-            fetched.push((start, fetcher.fetch(&req)?));
+            let got = fetcher.fetch(&req)?;
+            log::debug!("  range {start}+{n} -> {} bytes", got.len());
+            fetched.push((start, got));
         }
         let w = self.working.get_mut(&id).unwrap();
         for (start, bytes) in fetched {
@@ -981,7 +1039,7 @@ impl Volume {
         }
         let mut ready = Vec::new();
         for (id, w) in &self.working {
-            let real_blocks = (self.geometry.chunk_len(*id) / BLOCK).max(1);
+            let real_blocks = (self.geometry.object_len(*id) / BLOCK).max(1);
             let threshold = (real_blocks * self.policy.full_pct / 100).max(1);
             if w.dirty.len() as u64 >= threshold || w.since.elapsed() >= self.policy.max_age {
                 ready.push(*id);
@@ -1282,7 +1340,10 @@ mod tests {
         v.write(0, 1, &blocks(1, 1)).unwrap();
         v.flush().unwrap();
         let after_create = store.stored_bytes();
-        assert!(after_create >= DEFAULT_CHUNK, "first upload creates the object");
+        assert!(
+            after_create >= DEFAULT_OBJECT,
+            "first upload creates the object ({after_create} bytes)"
+        );
 
         v.write(7, 1, &blocks(1, 2)).unwrap();
         v.flush().unwrap();
@@ -1337,7 +1398,8 @@ mod tests {
             ..Policy::default()
         };
         let mut v = mem_volume(DEFAULT_CHUNK, policy);
-        let half = (DEFAULT_CHUNK / BLOCK / 2) as usize;
+        // Half of one 4 MiB object, so exactly that object is ready to go.
+        let half = (DEFAULT_OBJECT / BLOCK / 2) as usize;
         v.write(0, half, &blocks(half, 9)).unwrap();
         assert_eq!(v.dirty_chunks(), 1);
         v.tick().unwrap();
@@ -1389,7 +1451,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blobdev-lr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(MemStore::new());
-        let half = (DEFAULT_CHUNK / BLOCK / 2) as usize;
+        let half = (DEFAULT_OBJECT / BLOCK / 2) as usize;
         let mut v = populate_and_reopen(store.clone(), &dir, DEFAULT_CHUNK, |v| {
             v.write(0, half, &blocks(half, 0x44)).unwrap();
         });
@@ -1398,7 +1460,10 @@ mod tests {
         v.read(0, half, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0x44));
         let first = store.fetched_bytes();
-        assert!(first >= DEFAULT_CHUNK, "sequential read should pull the chunk");
+        assert!(
+            first >= DEFAULT_OBJECT,
+            "sequential read should pull the object ({first} bytes)"
+        );
 
         v.read(0, half, &mut buf).unwrap();
         assert_eq!(store.fetched_bytes(), first, "second read caused IO");
@@ -1452,7 +1517,7 @@ mod tests {
                 Some(DiskCache::new(&cache_dir, 64 << 20)),
             )
             .unwrap();
-            let n = (DEFAULT_CHUNK / BLOCK) as usize;
+            let n = (DEFAULT_OBJECT / BLOCK) as usize;
             let mut buf = vec![0u8; n * BLOCK as usize];
             v.read(0, n, &mut buf).unwrap();
             assert_eq!(buf[0], 0x66);
@@ -1468,7 +1533,7 @@ mod tests {
         )
         .unwrap();
         let before = store.fetched_bytes();
-        let n = (DEFAULT_CHUNK / BLOCK) as usize;
+        let n = (DEFAULT_OBJECT / BLOCK) as usize;
         let mut buf = vec![0u8; n * BLOCK as usize];
         v.read(0, n, &mut buf).unwrap();
         assert_eq!(buf[0], 0x66);

@@ -150,6 +150,7 @@ fn geometry_is_persisted_and_reused() {
         v.geometry(),
         &Geometry {
             chunk_size: DEFAULT_CHUNK,
+            object_size: blobdev::volume::DEFAULT_OBJECT,
             size
         }
     );

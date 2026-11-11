@@ -25,12 +25,17 @@ pub const META_MAGIC: u64 = 0x424c_4f42_4d45_5430; // "BLOBMET0"
 #[allow(dead_code)]
 /// v1: per-chunk `[id][ndirty][uploaded][dirty...]`
 /// v2: adds a 32-bit uid after `uploaded`
-pub const META_VERSION: u32 = 2;
+/// v3: adds an explicit object size to the geometry
+pub const META_VERSION: u32 = 3;
 
 /// Geometry of a volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Geometry {
+    /// Logical addressing unit. Fixed for the life of the volume; changing it
+    /// would move every object boundary.
     pub chunk_size: u64,
+    /// Physical object size. Also fixed, for the same reason.
+    pub object_size: u64,
     pub size: u64,
 }
 
@@ -41,6 +46,28 @@ impl Geometry {
 
     pub fn chunk_blocks(&self) -> u64 {
         self.chunk_size / crate::volume::BLOCK
+    }
+
+    /// Number of objects one chunk is stored as.
+    pub fn objects_per_chunk(&self) -> u64 {
+        self.chunk_size / self.object_size
+    }
+
+    /// Object index and byte offset within it for a volume offset.
+    pub fn locate(&self, offset: u64) -> (u64, u64) {
+        let chunk = offset / self.chunk_size;
+        let in_chunk = offset % self.chunk_size;
+        let obj_in_chunk = in_chunk / self.object_size;
+        (
+            chunk * self.objects_per_chunk() + obj_in_chunk,
+            in_chunk % self.object_size,
+        )
+    }
+
+    /// Length of object `obj` in bytes (the last one may be short).
+    pub fn object_len(&self, obj: u64) -> u64 {
+        let start = obj * self.object_size;
+        self.size.saturating_sub(start).min(self.object_size)
     }
 
     /// Length of chunk `id` in bytes (the last chunk may be short).
@@ -63,6 +90,16 @@ impl Geometry {
         }
         if self.chunk_size % crate::volume::BLOCK != 0 {
             anyhow::bail!("chunk size must be a multiple of {}", crate::volume::BLOCK);
+        }
+        if self.object_size == 0 || self.object_size % crate::volume::BLOCK != 0 {
+            anyhow::bail!("object size must be a multiple of {}", crate::volume::BLOCK);
+        }
+        if self.chunk_size % self.object_size != 0 {
+            anyhow::bail!(
+                "chunk size {} must be a multiple of object size {}",
+                self.chunk_size,
+                self.object_size
+            );
         }
         Ok(())
     }
@@ -109,6 +146,7 @@ impl Snapshot {
         b.extend_from_slice(&META_MAGIC.to_le_bytes());
         b.extend_from_slice(&META_VERSION.to_le_bytes());
         b.extend_from_slice(&self.geometry.chunk_size.to_le_bytes());
+        b.extend_from_slice(&self.geometry.object_size.to_le_bytes());
         b.extend_from_slice(&self.geometry.size.to_le_bytes());
         b.extend_from_slice(&(self.chunks.len() as u64).to_le_bytes());
         for (id, st) in &self.chunks {
@@ -138,17 +176,27 @@ impl Snapshot {
             anyhow::bail!("bad metadata magic");
         }
         let version = u32::from_le_bytes(body[8..12].try_into().unwrap());
-        if version != 1 && version != META_VERSION {
+        if !(1..=META_VERSION).contains(&version) {
             anyhow::bail!("unsupported metadata version {version}");
         }
         let chunk_size = u64::from_le_bytes(body[12..20].try_into().unwrap());
-        let size = u64::from_le_bytes(body[20..28].try_into().unwrap());
-        let geometry = Geometry { chunk_size, size };
+        // v1/v2 had no object size: the chunk itself was the object.
+        let object_size = if version >= 3 {
+            u64::from_le_bytes(body[20..28].try_into().unwrap())
+        } else {
+            chunk_size
+        };
+        let size = u64::from_le_bytes(body[28..36].try_into().unwrap());
+        let geometry = Geometry {
+            chunk_size,
+            object_size,
+            size,
+        };
         geometry.validate()?;
 
-        let count = u64::from_le_bytes(body[28..36].try_into().unwrap());
+        let count = u64::from_le_bytes(body[36..44].try_into().unwrap());
         let mut chunks = BTreeMap::new();
-        let mut off = 36usize;
+        let mut off = 44usize;
         for _ in 0..count {
             if off + 17 > body.len() {
                 anyhow::bail!("metadata snapshot truncated");
@@ -315,11 +363,16 @@ impl MetaStore for FileMeta {
 mod tests {
     use super::*;
 
+    fn geom(chunk_size: u64, size: u64) -> Geometry {
+        Geometry {
+            chunk_size,
+            object_size: chunk_size.min(4 << 20),
+            size,
+        }
+    }
+
     fn sample() -> Snapshot {
-        let g = Geometry {
-            chunk_size: 8 << 20,
-            size: 64 << 20,
-        };
+        let g = geom(8 << 20, 64 << 20);
         let mut s = Snapshot::new(g);
         let mut st = ChunkState::default();
         st.dirty.insert(0, ());
@@ -379,26 +432,20 @@ mod tests {
     #[test]
     fn geometry_validation() {
         // A volume smaller than one chunk is fine: the only chunk is short.
-        let small = Geometry {
-            chunk_size: 8 << 20,
-            size: 1 << 20,
-        };
+        let small = geom(8 << 20, 1 << 20);
         assert!(small.validate().is_ok());
         assert_eq!(small.chunk_len(0), 1 << 20);
         assert_eq!(small.chunks(), 0, "integer chunk count understates a short tail");
 
-        assert!(Geometry { chunk_size: 0, size: 0 }.validate().is_err());
+        assert!(geom(0, 0).validate().is_err());
         // Must end on a block boundary.
-        assert!(Geometry { chunk_size: 4096, size: 4096 }.validate().is_ok());
-        assert!(Geometry { chunk_size: 4096, size: 4097 }.validate().is_err());
+        assert!(geom(4096, 4096).validate().is_ok());
+        assert!(geom(4096, 4097).validate().is_err());
         // Chunk size must be a whole number of blocks.
-        assert!(Geometry { chunk_size: 1000, size: 1000 }.validate().is_err());
+        assert!(geom(1000, 1000).validate().is_err());
 
         // A non-multiple tail: 2.5 chunks.
-        let odd = Geometry {
-            chunk_size: 8 << 20,
-            size: (8 << 20) * 2 + (4 << 20),
-        };
+        let odd = geom(8 << 20, (8 << 20) * 2 + (4 << 20));
         assert!(odd.validate().is_ok());
         assert_eq!(odd.chunk_len(2), 4 << 20);
     }

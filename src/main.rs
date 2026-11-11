@@ -41,7 +41,8 @@ backends:
 
 options:
   --meta PATH        metadata file (default: ./<volume>.meta)
-  --chunk-mib N      chunk size in MiB (default 8)
+  --chunk-mib N      logical chunk size in MiB (default 64)
+  --object-mib N     storage object size in MiB (default 4)
   --create-size S    create the volume, e.g. 1G, 500M (only when new)
   --id N             ublk device id (-1 = allocate)
   --queues N         queue count (default 1)
@@ -186,6 +187,13 @@ fn run(args: &[String]) -> Result<()> {
                     anyhow::bail!("--chunk-mib must be at least 1");
                 }
                 c = c.with_chunk_size(mib << 20);
+            }
+            if let Some(mib) = arg(args, "--object-mib") {
+                let mib: u64 = mib.parse().context("bad --object-mib")?;
+                if mib == 0 {
+                    anyhow::bail!("--object-mib must be at least 1");
+                }
+                c = c.with_object_size(mib << 20);
             }
             Some(c)
         }

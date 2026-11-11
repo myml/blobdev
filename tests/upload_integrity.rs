@@ -368,3 +368,60 @@ fn many_chunks_roundtrip_large() {
     assert!(bad.is_empty(), "blocks differ after roundtrip: {bad:?}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Rewriting part of an object that was just uploaded must not lose the rest.
+///
+/// The upload moves the chunk out of the working set and into the caches. A
+/// later write to the same object used to start from an empty partial copy,
+/// ignoring the cached bytes, so the next full upload published zeros for
+/// every block that write did not itself touch. On a filesystem that shows up
+/// as data that reads correctly until the page cache is dropped.
+#[test]
+fn rewrite_after_upload_keeps_cached_bytes() {
+    let root = std::env::temp_dir().join(format!("blobdev-rw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = 4 * DEFAULT_CHUNK;
+
+    let obj_blocks = (blobdev::volume::DEFAULT_OBJECT / BLOCK) as usize;
+    let data = pattern(obj_blocks as u64);
+    let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        Some(Create::new(size)),
+        Policy::default(),
+    )
+    .unwrap();
+
+    // Upload the whole first object.
+    v.write(0, obj_blocks, &data).unwrap();
+    v.flush().unwrap();
+
+    // Change one block in it.
+    let changed = vec![0xEEu8; BLOCK as usize];
+    v.write(7, 1, &changed).unwrap();
+    v.flush().unwrap();
+
+    // Everything except block 7 must still be there.
+    let mut got = vec![0u8; data.len()];
+    v.read(0, obj_blocks, &mut got).unwrap();
+    for b in 0..obj_blocks as u64 {
+        let off = (b * BLOCK) as usize;
+        let want = if b == 7 {
+            &changed[..]
+        } else {
+            &data[off..off + BLOCK as usize]
+        };
+        assert_eq!(
+            &got[off..off + BLOCK as usize],
+            want,
+            "block {b} was lost when an uploaded object was rewritten"
+        );
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

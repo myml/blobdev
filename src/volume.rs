@@ -949,7 +949,7 @@ impl Volume {
             return Ok(());
         };
         log::debug!(
-            "complete object {id}: known={} of {} blocks",
+            "object {id}: filling in {} of {} blocks from the store",
             w.known.len(),
             w.data.len().div_ceil(BLOCK as usize)
         );
@@ -977,9 +977,7 @@ impl Volume {
                 len: n,
                 whole: false,
             };
-            let got = fetcher.fetch(&req)?;
-            log::debug!("  range {start}+{n} -> {} bytes", got.len());
-            fetched.push((start, got));
+            fetched.push((start, fetcher.fetch(&req)?));
         }
         let w = self.working.get_mut(&id).unwrap();
         for (start, bytes) in fetched {

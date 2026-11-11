@@ -122,16 +122,22 @@ pub struct Fetcher {
     geometry: Geometry,
     caps: Caps,
     uids: HashMap<u64, u32>,
+    legacy_uid_keys: bool,
 }
 
 impl Fetcher {
     fn object_key(&self, id: u64) -> String {
         // uid 0 means "patched in place, the key is the object index". It must
-        // not be treated as a real uid: chunk_key(0) and the index key of
-        // object 0 are the same string, so every other object would resolve to
-        // object 0's bytes.
+        // not be treated as a real uid: a uid that equals an object index
+        // makes the two objects share a key.
         match self.uids.get(&id) {
-            Some(uid) if *uid != 0 => self.layout.chunk_key(*uid),
+            Some(uid) if *uid != 0 => {
+                if self.legacy_uid_keys {
+                    self.layout.legacy_chunk_key(*uid as u64)
+                } else {
+                    self.layout.chunk_key(*uid)
+                }
+            }
             _ => self.layout.legacy_chunk_key(id),
         }
     }
@@ -260,8 +266,14 @@ impl Layout {
     /// after it is written, so a new version can be uploaded while the old one
     /// is still being served.
     /// Key of one physical object.
+    /// Key of an object written under a fresh uid.
+    ///
+    /// The `u` prefix keeps this namespace disjoint from the index-keyed
+    /// objects patched in place (`<root>/c/<object index>`). Without it,
+    /// uid 4 and object 4 are the same key: the patched object was deleted
+    /// when the uid-keyed one was superseded, and the volume lost its data.
     pub fn chunk_key(&self, uid: u32) -> String {
-        format!("{}/c/{}", self.root, uid)
+        format!("{}/c/u{}", self.root, uid)
     }
 
     /// The pre-uid layout, where the chunk index doubled as the object name.
@@ -380,6 +392,8 @@ pub struct Volume {
     uids: HashMap<u64, u32>,
     /// Next uid to hand out.
     next_uid: u32,
+    /// True for volumes written before uid-keyed objects got their `u` prefix.
+    legacy_uid_keys: bool,
     /// Objects superseded by a committed upload, awaiting deletion.
     garbage: Vec<String>,
     /// Objects deleted because a newer version replaced them.
@@ -478,6 +492,7 @@ impl Volume {
             partial_reads: 0,
             uids: HashMap::new(),
             next_uid: 1,
+            legacy_uid_keys: false,
             garbage: Vec::new(),
             reclaimed: 0,
         };
@@ -511,6 +526,26 @@ impl Volume {
         }
         let nchunks = snap.chunks.values().filter(|s| !s.dirty.is_empty()).count();
         let nblocks: usize = snap.chunks.values().map(|s| s.dirty.len()).sum();
+        // Decide once which spelling this volume uses for uid-keyed objects:
+        // `u<uid>` is current, `<uid>` is what volumes written before the
+        // prefix contain. Reading the wrong one finds nothing, so pick it from
+        // an object that is known to exist.
+        for (id, st) in &snap.chunks {
+            if st.uploaded && st.uid != 0 {
+                let current = self.layout.chunk_key(st.uid);
+                let old = self.layout.legacy_chunk_key(st.uid as u64);
+                let has_current = self.data.stat(&current)?.is_some();
+                let has_old = self.data.stat(&old)?.is_some();
+                self.legacy_uid_keys = !has_current && has_old;
+                if !has_current && !has_old {
+                    log::warn!(
+                        "object {id}: neither {current} nor {old} exists; \
+                         the volume may have lost an object"
+                    );
+                }
+                break;
+            }
+        }
         // Every chunk present in the store has a committed object uid.
         for (id, st) in &snap.chunks {
             if st.uploaded {
@@ -564,13 +599,29 @@ impl Volume {
 
     /// Key of the object that holds object index `id`.
     ///
-    /// `uid` 0 marks an object that was patched in place and is stored under
-    /// its index; it is not a usable uid, because `chunk_key(0)` names object
-    /// 0 and every object would then read object 0's bytes.
+    /// A patched object (uid 0) is stored under its index. A uid-keyed object
+    /// is stored under `u<uid>`; volumes written before that prefix existed
+    /// stored it under `<uid>`, so both spellings are recognised on read.
+    /// Without the prefix, uid 4 and object 4 are the same key and the two
+    /// objects overwrite and delete each other.
     fn object_key(&self, id: u64) -> String {
         match self.uids.get(&id) {
-            Some(uid) if *uid != 0 => self.layout.chunk_key(*uid),
+            Some(uid) if *uid != 0 => self.existing_uid_key(*uid),
             _ => self.layout.legacy_chunk_key(id),
+        }
+    }
+
+    /// Key for a uid, honouring the spelling this volume was written with.
+    ///
+    /// Volumes created before the `u` prefix stored uid-keyed objects as
+    /// `<uid>`. The spelling is decided once when the volume is opened (by
+    /// looking at an object that must exist) and then used for every key, so
+    /// the read path pays nothing.
+    fn existing_uid_key(&self, uid: u32) -> String {
+        if self.legacy_uid_keys {
+            self.layout.legacy_chunk_key(uid as u64)
+        } else {
+            self.layout.chunk_key(uid)
         }
     }
 
@@ -593,6 +644,7 @@ impl Volume {
             geometry: self.geometry.clone(),
             caps: self.caps,
             uids: self.uids.clone(),
+            legacy_uid_keys: self.legacy_uid_keys,
         }
     }
 
@@ -749,8 +801,15 @@ impl Volume {
         if chunk_len == 0 {
             return false;
         }
-        // Treat it as sequential IO once the request covers this much of the
-        // chunk; below that we save bandwidth at the cost of a cache miss.
+        // A backend that charges the same for a small range as for the whole
+        // object makes ranged reads pure loss: they save bandwidth nobody is
+        // short of and cost a round trip each. Ask for the object whenever a
+        // miss happens there.
+        if self.data.caps().expensive_range_read {
+            return true;
+        }
+        // Otherwise treat it as sequential IO once the request covers this much
+        // of the chunk; below that we save bandwidth at the cost of a miss.
         want.saturating_mul(100) >= chunk_len * self.policy.whole_chunk_pct
     }
 
@@ -958,6 +1017,12 @@ impl Volume {
         };
 
         let previous = self.uids.insert(id, uid);
+        if std::env::var("BLOBDEV_TRACE").is_ok() {
+            log::info!(
+                "commit object {id} -> c/{uid} (previous {:?}); meta saved next",
+                previous
+            );
+        }
         self.save_meta()?;
 
         let w = self.working.remove(&id).unwrap();
@@ -1057,7 +1122,12 @@ impl Volume {
         let pending = std::mem::take(&mut self.garbage);
         for key in pending {
             match self.data.delete(&key) {
-                Ok(()) => self.reclaimed += 1,
+                Ok(()) => {
+                    if std::env::var("BLOBDEV_TRACE").is_ok() {
+                        log::info!("garbage: deleted {key}");
+                    }
+                    self.reclaimed += 1
+                }
                 Err(e) => log::warn!("could not delete superseded object {key}: {e:#}"),
             }
         }

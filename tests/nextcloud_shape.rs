@@ -168,6 +168,7 @@ fn a_backend_that_flips_to_whole_object_mid_run() {
                 range_read: true,
                 partial_write: self.patches.load(Ordering::SeqCst) == 0,
                 conditional_write: false,
+                expensive_range_read: false,
             }
         }
         fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {

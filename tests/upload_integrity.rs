@@ -570,6 +570,7 @@ fn a_backend_that_cannot_patch_is_asked_only_once() {
                 range_read: true,
                 partial_write: !self.refuses.load(Ordering::SeqCst),
                 conditional_write: true,
+                expensive_range_read: false,
             }
         }
         fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
@@ -647,5 +648,186 @@ fn a_backend_that_cannot_patch_is_asked_only_once() {
         v.read(round * obj_blocks + 2, 1, &mut buf).unwrap();
         assert_eq!(buf[0], 0xF0 + round as u8, "patch {round} was lost");
     }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A uid and an object index must never name the same key.
+///
+/// Patched objects are stored under their index (`c/<id>`) and uid-keyed ones
+/// under `c/u<uid>`. Without the prefix, uid 4 and object 4 are the same
+/// string: superseding the patched object 4 deleted the uid-keyed object 4,
+/// and the volume lost that data while its metadata kept pointing at it.
+///
+/// This is reachable on any backend that starts by patching (WebDAV) and then
+/// switches to whole-object writes, which is exactly what Nextcloud makes it
+/// do by rejecting a ranged PUT.
+#[test]
+fn a_uid_never_collides_with_an_object_index() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    struct Switches {
+        inner: DirStore,
+        patches: AtomicU32,
+        refuses: AtomicBool,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+    impl ObjectStore for Switches {
+        fn caps(&self) -> Caps {
+            Caps {
+                range_read: true,
+                partial_write: !self.refuses.load(Ordering::SeqCst),
+                conditional_write: false,
+                expensive_range_read: true,
+            }
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.keys.lock().unwrap().push(key.to_string());
+            self.inner.put(key, data)
+        }
+        fn patch(&self, k: &str, o: u64, d: &[u8]) -> anyhow::Result<()> {
+            // The first patch succeeds so the store gets index-keyed objects;
+            // later ones are refused, which pushes the volume onto the
+            // uid-keyed path. The collision only exists when both are present.
+            if self.patches.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self.inner.patch(k, o, d);
+            }
+            self.refuses.store(true, Ordering::SeqCst);
+            anyhow::bail!("partial write not supported")
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-collide-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
+    let bytes = obj_blocks * BLOCK * 24; // enough objects for the indices to matter
+    let mut data = vec![0u8; bytes as usize];
+    for b in 0..(bytes / BLOCK) {
+        data[(b * BLOCK) as usize..((b + 1) * BLOCK) as usize]
+            .fill((b as u8).wrapping_mul(13).wrapping_add(5));
+    }
+
+    let store = Arc::new(Switches {
+        inner: DirStore::new(&objects).unwrap(),
+        patches: AtomicU32::new(0),
+        refuses: AtomicBool::new(false),
+        keys: std::sync::Mutex::new(Vec::new()),
+    });
+    {
+        let mut v = Volume::open(
+            store.clone() as Arc<dyn ObjectStore>,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        let piece = (1 << 20) / BLOCK as usize;
+        let blocks = (bytes / BLOCK) as usize;
+        let mut done = 0;
+        while done < blocks {
+            let n = piece.min(blocks - done);
+            v.write(
+                done as u64,
+                n,
+                &data[done * BLOCK as usize..(done + n) * BLOCK as usize],
+            )
+            .unwrap();
+            done += n;
+        }
+        v.flush().unwrap();
+        // A second pass over the same objects: the first patch succeeds (index
+        // key), the rest are refused (uid keys).
+        done = 0;
+        while done < blocks {
+            let n = piece.min(blocks - done);
+            v.write(
+                done as u64,
+                n,
+                &data[done * BLOCK as usize..(done + n) * BLOCK as usize],
+            )
+            .unwrap();
+            done += n;
+            v.flush().unwrap();
+        }
+    }
+
+    // The two namespaces must not overlap as strings. A small volume has uids
+    // in the same numeric range as object indices, so the prefix is what keeps
+    // them apart -- without it uid 4 and object 4 are both `c/4`.
+    let keys = store.keys.lock().unwrap().clone();
+    assert!(!keys.is_empty(), "nothing was written");
+    for k in &keys {
+        let name = k.rsplit('/').next().unwrap_or_default();
+        let numeric = name.parse::<u64>().is_ok();
+        let prefixed = name.starts_with('u');
+        assert!(
+            numeric || prefixed,
+            "unexpected key spelling: {k} (index-keyed and uid-keyed objects \
+             must be distinguishable by name)"
+        );
+    }
+    let both_kinds = keys.iter().any(|k| {
+        let n = k.rsplit('/').next().unwrap_or_default();
+        n.starts_with('u')
+    }) && keys.iter().any(|k| {
+        let n = k.rsplit('/').next().unwrap_or_default();
+        n.parse::<u64>().is_ok()
+    });
+    assert!(both_kinds, "the test did not produce both key kinds: {keys:?}");
+
+    let store = Arc::new(Switches {
+        inner: DirStore::new(&objects).unwrap(),
+        patches: AtomicU32::new(1),
+        refuses: AtomicBool::new(true),
+        keys: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut v = Volume::open(
+        store as Arc<dyn ObjectStore>,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    let blocks = (bytes / BLOCK) as usize;
+    let mut got = vec![0u8; data.len()];
+    let piece = (1 << 20) / BLOCK as usize;
+    let mut done = 0;
+    while done < blocks {
+        let n = piece.min(blocks - done);
+        v.read(
+            done as u64,
+            n,
+            &mut got[done * BLOCK as usize..(done + n) * BLOCK as usize],
+        )
+        .unwrap();
+        done += n;
+    }
+    let mut bad = Vec::new();
+    for b in 0..blocks {
+        let off = b * BLOCK as usize;
+        if got[off] != data[off] {
+            bad.push(b as u64);
+            if bad.len() > 5 {
+                break;
+            }
+        }
+    }
+    assert!(bad.is_empty(), "blocks lost to a key collision: {bad:?}");
     std::fs::remove_dir_all(&root).ok();
 }

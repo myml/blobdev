@@ -31,6 +31,14 @@ pub struct Caps {
     pub partial_write: bool,
     /// Writes can be made conditional on the object's current ETag.
     pub conditional_write: bool,
+    /// A ranged read costs about as much as reading the whole object.
+    ///
+    /// True for servers that pay a fixed price per request regardless of how
+    /// many bytes come back. Nextcloud is one: a 4 KiB range takes the same
+    /// 250 ms as the whole 4 MiB object, because PHP bootstraps per request.
+    /// Asking for tiny ranges there turns a sequential read into thousands of
+    /// round trips -- 24 MiB took 52 seconds, 0.5 MB/s, until this was known.
+    pub expensive_range_read: bool,
 }
 
 impl Caps {
@@ -39,6 +47,7 @@ impl Caps {
         range_read: true,
         partial_write: true,
         conditional_write: false,
+        expensive_range_read: false,
     };
 
     /// S3: whole-object replacement only, but ETags are available.
@@ -46,6 +55,7 @@ impl Caps {
         range_read: true,
         partial_write: false,
         conditional_write: true,
+        expensive_range_read: false,
     };
 }
 

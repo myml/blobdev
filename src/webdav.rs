@@ -773,6 +773,10 @@ impl ObjectStore for WebDavStore {
                 .load(std::sync::atomic::Ordering::SeqCst),
             // WebDAV has no conditional PUT that is portable enough to rely on.
             conditional_write: false,
+            // PHP-backed servers pay per request, not per byte: measured on
+            // Nextcloud, a 4 KiB range and the whole 4 MiB object both take
+            // about 250 ms.
+            expensive_range_read: true,
         }
     }
 
@@ -917,8 +921,13 @@ mod tests {
     fn store_construction_validates() {
         let s = WebDavStore::new(WebDavConfig::new(BASE).with_prefix("/vol x/")).unwrap();
         assert_eq!(s.cfg.prefix, "vol x");
-        assert_eq!(s.caps(), Caps::FULL);
-        assert!(s.caps().partial_write);
+        // WebDAV can patch and read ranges, but a range costs a request, and
+        // plenty of servers refuse the patch outright -- the store reports
+        // that only after it has been refused.
+        let caps = s.caps();
+        assert!(caps.range_read);
+        assert!(caps.partial_write);
+        assert!(caps.expensive_range_read);
         assert_eq!(s.name(), "webdav");
         assert_eq!(
             s.url_for("c/1"),

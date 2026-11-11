@@ -19,6 +19,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# /tmp is often a tmpfs on test hosts. Filling it makes later runs fail in a
+# way that looks like a blobdev bug, so refuse to start without room.
+AVAIL_KB=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "${AVAIL_KB:-}" ] && [ "$AVAIL_KB" -lt $((1024 * 1024)) ]; then
+  echo "FAIL: less than 1 GiB free in /tmp" >&2
+  df -h /tmp >&2
+  exit 1
+fi
+
 rm -rf "$ROOT"; mkdir -p "$ROOT/objects" "$ROOT/cache"
 
 echo "== start the device"

@@ -15,6 +15,16 @@ SIZE=${SIZE:-2G}
 DURATION=${1:-${DURATION:-900}}
 SAMPLE_EVERY=${SAMPLE_EVERY:-30}
 
+# /tmp is often a tmpfs sized from RAM on test hosts, and these runs leave
+# hundreds of megabytes behind. Filling it makes every later run fail in a way
+# that looks like a blobdev bug, so refuse to start with no room.
+AVAIL_KB=$(df -Pk "$(dirname "$ROOT")" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "${AVAIL_KB:-}" ] && [ "$AVAIL_KB" -lt $((1024 * 1024)) ]; then
+  echo "FAIL: less than 1 GiB free under $(dirname "$ROOT")" >&2
+  df -h "$(dirname "$ROOT")" >&2
+  exit 1
+fi
+
 mkdir -p "$ROOT"
 pkill -9 -x blobdev 2>/dev/null
 sleep 1
@@ -30,6 +40,9 @@ cleanup() {
   pkill -9 -x blobdev 2>/dev/null
 }
 trap cleanup EXIT
+
+# Leave nothing behind: these runs are large and hosts accumulate them.
+trap 'cleanup; rm -rf "$ROOT"' EXIT
 
 # shellcheck disable=SC2086
 BLOBDEV_SUMMARY_SECS=60 "$BIN" run $BLOBDEV_ARGS --volume "$VOL" --meta "$ROOT/v.meta" \

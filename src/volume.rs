@@ -660,7 +660,15 @@ impl Volume {
     /// it covers only part of the chunk, so caching it would serve zeros for
     /// the rest. Use [`Volume::read`] (or the ublk path) for range reads,
     /// which copies them straight into the caller's buffer.
+    ///
+    /// The fetch ran without the lock, so the chunk may have gained a working
+    /// copy in the meantime. That copy is newer than whatever was just
+    /// fetched, so it wins: caching the fetched bytes would resurrect the
+    /// previous contents of a chunk that has just been written.
     pub fn apply_fetch(&mut self, req: &FetchRequest, data: Vec<u8>) {
+        if self.working.contains_key(&req.chunk) {
+            return;
+        }
         if !req.whole {
             self.partial_reads += 1;
             return;

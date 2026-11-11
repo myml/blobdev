@@ -253,25 +253,14 @@ fn handle_command(
     let bytes = (iod.nr_sectors as usize) * 512;
     let buf_len = buf.len();
 
-    let res = if buf_len > 0 && bytes > buf_len && op != libublk::sys::UBLK_IO_OP_FLUSH {
-        // Serve a large command in windows over the same memory.
-        let mut res: i32 = 0;
-        let mut off = 0usize;
-        while off < bytes {
-            let n = (bytes - off).min(buf_len);
-            let r = process_op(&s.volume, op, sector + off as u64, n, &mut buf[..n], fua);
-            if r < 0 {
-                res = r;
-                break;
-            }
-            res += r;
-            off += n;
-        }
-        res
-    } else {
-        let n = bytes.min(buf_len);
-        process_op(&s.volume, op, sector, n, &mut buf[..n], fua)
-    };
+    let res = serve_windows(
+        &s.volume,
+        op,
+        sector,
+        bytes,
+        buf,
+        fua,
+    );
 
     // The COMMIT must carry the address the FETCH used. A FLUSH has no data,
     // so reuse the tag's real buffer rather than an empty slice (NULL).
@@ -344,6 +333,62 @@ pub fn process_op(
             -libc::EOPNOTSUPP
         }
     }
+}
+
+/// Serve one command, splitting it into windows that fit the tag buffer.
+///
+/// The buffer holds the data, so window `i` must read and write its own slice
+/// of it. Serving every window from the front of the buffer is wrong in a way
+/// that only shows up on large IOs: the first window lands correctly and every
+/// later one repeats it.
+///
+/// A window as large as the buffer maps one to one onto its slice; a smaller
+/// final window is staged through a scratch buffer.
+fn serve_windows(
+    volume: &Mutex<Volume>,
+    op: u32,
+    sector: u64,
+    bytes: usize,
+    buf: &mut [u8],
+    fua: bool,
+) -> i32 {
+    let buf_len = buf.len();
+    if buf_len == 0 || bytes <= buf_len || op == libublk::sys::UBLK_IO_OP_FLUSH {
+        let n = bytes.min(buf_len);
+        return process_op(volume, op, sector, n, &mut buf[..n], fua);
+    }
+    let mut res: i32 = 0;
+    let mut off = 0usize;
+    let mut scratch: Vec<u8> = Vec::new();
+    while off < bytes {
+        let n = (bytes - off).min(buf_len);
+        let r = if n == buf_len {
+            process_op(
+                volume,
+                op,
+                sector + off as u64,
+                n,
+                &mut buf[off..off + n],
+                fua,
+            )
+        } else {
+            scratch.resize(n, 0);
+            if op == libublk::sys::UBLK_IO_OP_WRITE {
+                scratch.copy_from_slice(&buf[off..off + n]);
+            }
+            let r = process_op(volume, op, sector + off as u64, n, &mut scratch, fua);
+            if r >= 0 && op != libublk::sys::UBLK_IO_OP_WRITE {
+                buf[off..off + n].copy_from_slice(&scratch);
+            }
+            r
+        };
+        if r < 0 {
+            return r;
+        }
+        res += r;
+        off += n;
+    }
+    res
 }
 
 /// Serve a read in three phases so the network is never touched under the lock:
@@ -493,6 +538,57 @@ mod tests {
             0,
             "a FUA write must leave nothing dirty"
         );
+    }
+
+    /// Regression: a command larger than the tag buffer must not serve every
+    /// window from the front of the buffer.
+    ///
+    /// This is invisible for small IOs: only the second and later windows are
+    /// wrong, and they merely repeat the first one.
+    #[test]
+    fn large_commands_serve_their_own_windows() {
+        let v = test_volume();
+        let total = 1 << 20;
+        let window = 256 << 10;
+        // Distinct, recognisable content in every window.
+        let mut data = vec![0u8; total];
+        for w in 0..(total / window) {
+            for i in 0..window {
+                data[w * window + i] = (w as u8).wrapping_mul(37).wrapping_add(1);
+            }
+        }
+
+        let mut buf = data.clone();
+        let r = serve_windows(
+            &v,
+            libublk::sys::UBLK_IO_OP_WRITE,
+            0,
+            total,
+            &mut buf,
+            false,
+        );
+        assert_eq!(r, total as i32);
+
+        let mut got = vec![0u8; total];
+        let r = serve_windows(
+            &v,
+            libublk::sys::UBLK_IO_OP_READ,
+            0,
+            total,
+            &mut got,
+            false,
+        );
+        assert_eq!(r, total as i32);
+
+        for w in 0..(total / window) {
+            let a = w * window;
+            let b = a + window;
+            assert_eq!(
+                &got[a..b],
+                &data[a..b],
+                "window {w} (bytes {a}..{b}) came back wrong"
+            );
+        }
     }
 
     #[test]

@@ -548,3 +548,104 @@ fn patched_objects_do_not_alias_object_zero() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A backend that discovers it cannot patch must not be asked again.
+///
+/// Real servers do this: Nextcloud answers a ranged PUT with 400. Falling
+/// back to a whole-object upload is correct, but repeating the rejected
+/// attempt for every object wastes a request each time -- 19 of them in one
+/// run against Nextcloud, before the store started remembering.
+#[test]
+fn a_backend_that_cannot_patch_is_asked_only_once() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    struct NoRangedPatch {
+        inner: DirStore,
+        patches: AtomicU32,
+        refuses: AtomicBool,
+    }
+    impl ObjectStore for NoRangedPatch {
+        fn caps(&self) -> Caps {
+            Caps {
+                range_read: true,
+                partial_write: !self.refuses.load(Ordering::SeqCst),
+                conditional_write: true,
+            }
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.inner.put(key, data)
+        }
+        fn patch(&self, key: &str, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+            self.patches.fetch_add(1, Ordering::SeqCst);
+            self.refuses.store(true, Ordering::SeqCst);
+            anyhow::bail!("partial write not supported by this server")
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-once-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let store = Arc::new(NoRangedPatch {
+        inner: DirStore::new(&objects).unwrap(),
+        patches: AtomicU32::new(0),
+        refuses: AtomicBool::new(false),
+    });
+
+    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
+    let mut v = Volume::open(
+        store.clone() as Arc<dyn ObjectStore>,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        Some(Create::new(4 * DEFAULT_CHUNK)),
+        Policy::default(),
+    )
+    .unwrap();
+
+    // Write and upload several objects whole, so later writes have something
+    // to patch rather than create.
+    for round in 0..4u64 {
+        let base = round * obj_blocks;
+        let mut data = vec![0u8; obj_blocks as usize * BLOCK as usize];
+        data.fill(round as u8 + 1);
+        v.write(base, obj_blocks as usize, &data).unwrap();
+        v.flush().unwrap();
+    }
+    // Now a small write to each existing object, which is what a patch is for.
+    for round in 0..4u64 {
+        let base = round * obj_blocks;
+        let mut data = vec![0u8; BLOCK as usize];
+        data.fill(0xF0 + round as u8);
+        v.write(base + 2, 1, &data).unwrap();
+        v.flush().unwrap();
+    }
+
+    assert_eq!(
+        store.patches.load(Ordering::SeqCst),
+        1,
+        "the server was asked to patch again after refusing once"
+    );
+
+    // Every object must still read back: the fallbacks wrote them whole.
+    let mut buf = vec![0u8; BLOCK as usize];
+    for round in 0..4u64 {
+        v.read(round * obj_blocks, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], round as u8 + 1, "object {round} was not written");
+        v.read(round * obj_blocks + 2, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xF0 + round as u8, "patch {round} was lost");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

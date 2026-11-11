@@ -885,7 +885,11 @@ impl Volume {
             return Ok(0);
         }
 
-        if self.caps.partial_write {
+        // Ask the store each time: a backend that has just discovered it
+        // cannot patch (a ranged PUT rejected, or one that truncated the
+        // object) reports partial_write = false from then on, and honouring
+        // that saves a doomed request per upload for the rest of the run.
+        if self.data.caps().partial_write {
             // Patching needs a base object. If there is none, or if this write
             // covers most of the chunk, the whole object has to be written --
             // and a whole-object write must not publish zeros for blocks this
@@ -1167,7 +1171,11 @@ impl Volume {
                 self.working.len()
             );
         }
-        if self.caps.partial_write {
+        // Ask the store each time: a backend that has just discovered it
+        // cannot patch (a ranged PUT rejected, or one that truncated the
+        // object) reports partial_write = false from then on, and honouring
+        // that saves a doomed request per upload for the rest of the run.
+        if self.data.caps().partial_write {
             // Objects are patched in place and named by chunk index, so there
             // is nothing orphaned to reclaim.
             return Ok(GcReport::default());

@@ -442,18 +442,66 @@ impl WebDavStore {
     /// Creating a collection that already exists answers `405`, which is the
     /// normal case once the volume has been used; only a `409` (the parent's
     /// parent is missing) is an error.
+    /// Create the collections leading to `key`, outermost first.
+    ///
+    /// Only the immediate parent used to be created, which works when the
+    /// volume prefix already exists -- and fails everywhere else: Nextcloud
+    /// answers 409 for a missing parent, so `<volume>/c/<n>` could never be
+    /// written on a fresh volume whose `<volume>` directory was not there.
     fn mkcol(&self, key: &str) -> Result<()> {
-        let url = parent_path(&self.base, &self.cfg.prefix, key);
-        if url == self.base {
+        let parent = parent_path(&self.base, &self.cfg.prefix, key);
+        if parent == self.base {
             return Ok(()); // the key is directly in the base collection
         }
-        let reply = self.request("MKCOL", &url, &[], None)?;
+        let prefix = format!("{}/", self.cfg.prefix).trim_matches('/').to_string();
+        let mut rel = parent
+            .strip_prefix(self.base.trim_end_matches('/'))
+            .unwrap_or(&parent)
+            .trim_matches('/')
+            .to_string();
+        // Do not try to create the configured prefix: it may live above the
+        // base URL and the caller is expected to have made it.
+        if !prefix.is_empty() {
+            if rel == prefix {
+                return Ok(());
+            }
+            if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
+                rel = rest.to_string();
+            }
+        }
+        let mut acc = self.base.trim_end_matches('/').to_string();
+        if !prefix.is_empty() {
+            acc.push('/');
+            acc.push_str(&prefix);
+        }
+        for seg in rel.split('/').filter(|s| !s.is_empty()) {
+            acc.push('/');
+            acc.push_str(seg);
+            self.mkcol_one(&acc)?;
+        }
+        Ok(())
+    }
+
+    fn mkcol_one(&self, url: &str) -> Result<()> {
+        let reply = self.request("MKCOL", url, &[], None)?;
         match reply.status {
             200..=299 => Ok(()),
             // 405 = already exists; 301/302/307 from servers that redirect a
-            // collection URL ending in `/'`. 409/403 from read-only roots
-            // surfaces later, but a failed PUT would be less clear.
+            // collection URL ending in `/'`.
             405 | 301 | 307 | 308 => Ok(()),
+            // Nextcloud answers MKCOL on an existing collection with 409, not
+            // 405. Ignoring it blindly would hide a real "no parent" failure,
+            // so ask the server whether the collection is there.
+            409 => {
+                if self.collection_exists(url)? {
+                    Ok(())
+                } else {
+                    anyhow::bail!(
+                        "MKCOL {url}: {} (the collection does not exist; a parent may be missing)",
+                        reply.describe()
+                    );
+                }
+            }
             // A server that does not implement MKCOL is not fatal: the PUT
             // that follows may create the parent implicitly (many do), and if
             // it does not, the PUT error will say so more directly.
@@ -462,6 +510,29 @@ impl WebDavStore {
                 Ok(())
             }
             _ => anyhow::bail!("MKCOL {url}: {}", reply.describe()),
+        }
+    }
+
+    /// Whether a collection already exists.
+    ///
+    /// PROPFIND with depth 0 is the portable way to ask; a 207 means the
+    /// collection is there. Servers that do not implement PROPFIND fall back
+    /// to "assume it does", which is what the MKCOL 409 implies on its own.
+    fn collection_exists(&self, url: &str) -> Result<bool> {
+        let mut target = url.to_string();
+        if !target.ends_with('/') {
+            target.push('/');
+        }
+        let reply = self.request("PROPFIND", &target, &[("Depth", "0")], None)?;
+        match reply.status {
+            207 => Ok(true),
+            200..=299 => Ok(true),
+            404 | 410 => Ok(false),
+            401 | 403 => Ok(false),
+            // 405/501: no PROPFIND support. Trust the MKCOL answer rather than
+            // inventing a failure the caller cannot act on.
+            405 | 501 => Ok(true),
+            _ => anyhow::bail!("PROPFIND {target}: {}", reply.describe()),
         }
     }
 
@@ -637,7 +708,14 @@ impl WebDavStore {
             // 400/405/501: the server will not do ranged writes. The volume
             // layer reacts to a *failed* patch by re-uploading the whole
             // object, so this must be an error, not a silent success.
-            400 | 405 | 501 => Err(partial_write_unsupported(&url, reply.status)),
+            400 | 405 | 501 => {
+                // Remember it: the volume asks `caps()` before every upload, so
+                // one rejected attempt per run is enough instead of one per
+                // object.
+                self.no_ranged_write
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(partial_write_unsupported(&url, reply.status))
+            }
             // 416: the object is a different size than we believed; the
             // caller's whole-object fallback is the right repair.
             409 | 412 | 416 => anyhow::bail!(
@@ -685,7 +763,16 @@ fn find_prop_number(body: &str, name: &str) -> Option<Result<u64, anyhow::Error>
 
 impl ObjectStore for WebDavStore {
     fn caps(&self) -> Caps {
-        Caps::FULL
+        Caps {
+            range_read: true,
+            // Cleared once this server proves it will not do a ranged write.
+            // The volume asks before every upload, so the rejected attempt
+            // happens once per run rather than once per object.
+            partial_write: !self
+                .no_ranged_write
+                .load(std::sync::atomic::Ordering::SeqCst),
+            conditional_write: true,
+        }
     }
 
     fn stat(&self, key: &str) -> Result<Option<u64>> {

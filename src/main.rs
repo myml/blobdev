@@ -29,7 +29,8 @@ fn usage() -> ! {
         "usage:
   blobdev run --volume NAME --create-size SIZE [options]
   blobdev stop --id N
-  blobdev status --id N
+  blobdev status                         list running and stale devices
+  blobdev reap [--dry-run]               remove devices with no daemon
   blobdev gc --volume NAME [--dry-run]   delete unreferenced chunk objects
   blobdev ls --volume NAME               list the volume's chunk objects
   blobdev inspect --volume NAME          check metadata against the store
@@ -111,6 +112,7 @@ fn real_main() -> Result<()> {
         "run" => run(&args),
         "stop" => stop(&args),
         "status" => status(&args),
+        "reap" => reap(&args),
         "gc" => gc(&args),
         "ls" => ls(&args),
         "inspect" => inspect(&args),
@@ -447,25 +449,121 @@ fn stop(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// List the running ublk devices.
+///
+/// ublk keeps its state in `/sys/class/ublk-char`, which exposes only the
+/// character-device number; the interesting numbers (dirty blocks, cache
+/// usage, uploads) live in the daemon. Rather than invent an IPC channel for
+/// a status command, this shows what the kernel and `/proc` already know --
+/// the device, its block node, and whether anything has it mounted -- and
+/// points at the log for the rest, which is what an operator reads anyway.
 fn status(_args: &[String]) -> Result<()> {
     let dir = std::path::Path::new("/sys/class/ublk-char");
     if !dir.exists() {
-        println!("ublk driver not loaded");
+        println!("ublk driver not loaded (modprobe ublk_drv)");
         return Ok(());
     }
-    let mut found = false;
-    for e in std::fs::read_dir(dir)? {
-        let e = e?;
-        let name = e.file_name();
-        let dev = std::fs::read_to_string(e.path().join("dev_id"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        println!("{} dev_id={dev}", name.to_string_lossy());
-        found = true;
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+
+    let mut ids: Vec<u32> = Vec::new();
+    for e in std::fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))? {
+        let name = e?.file_name().to_string_lossy().to_string();
+        // Character devices are named `ublkc<id>`.
+        if let Some(id) = name.strip_prefix("ublkc").and_then(|n| n.parse::<u32>().ok()) {
+            ids.push(id);
+        }
     }
-    if !found {
-        println!("no ublk devices");
+    ids.sort_unstable();
+    if ids.is_empty() {
+        println!("no ublk devices are running");
+        return Ok(());
+    }
+
+    println!("{:<6} {:<16} {:<14} {}", "ID", "BLOCK NODE", "MOUNTED AT", "DAEMON");
+    for id in ids {
+        let node = format!("/dev/ublkb{id}");
+        let node_exists = std::path::Path::new(&node).exists();
+        let at: Vec<&str> = mounts
+            .lines()
+            .filter(|l| l.split_whitespace().next() == Some(node.as_str()))
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+        // A device whose block node is gone has no daemon behind it: the
+        // process died without tearing it down (kill -9, OOM). Those are what
+        // `blobdev stop --id N` cleans up, and they are easy to mistake for
+        // running volumes, so say so.
+        let daemon = if node_exists { "running" } else { "stale" };
+        println!(
+            "{:<6} {:<16} {:<14} {}",
+            id,
+            if node_exists { node.as_str() } else { "-" },
+            if at.is_empty() {
+                "-".to_string()
+            } else {
+                at.join(" ")
+            },
+            daemon,
+        );
+    }
+    println!();
+    println!("for dirty blocks, uploads and cache hit rates, read the daemon log");
+    Ok(())
+}
+
+/// Remove ublk devices that no longer have a daemon behind them.
+///
+/// A daemon killed with SIGKILL cannot tear its device down, and the kernel
+/// keeps the device until someone asks for it to be removed. They accumulate,
+/// and each one is a device id that cannot be reused.
+fn reap(args: &[String]) -> Result<()> {
+    let dir = std::path::Path::new("/sys/class/ublk-char");
+    if !dir.exists() {
+        println!("ublk driver not loaded (modprobe ublk_drv)");
+        return Ok(());
+    }
+    let dry_run = flag(args, "--dry-run");
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let mut ids: Vec<u32> = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let name = e?.file_name().to_string_lossy().to_string();
+        if let Some(id) = name.strip_prefix("ublkc").and_then(|n| n.parse::<u32>().ok()) {
+            if !std::path::Path::new(&format!("/dev/ublkb{id}")).exists() {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    if ids.is_empty() {
+        println!("no stale devices");
+        return Ok(());
+    }
+    let mut removed = 0;
+    for id in &ids {
+        // Never remove something that is still mounted: the data is live even
+        // if the block node looks stale.
+        let node = format!("/dev/ublkb{id}");
+        if mounts.lines().any(|l| l.starts_with(&format!("{node} "))) {
+            println!("device {id}: still mounted, left alone");
+            continue;
+        }
+        if dry_run {
+            println!("device {id}: would remove");
+            continue;
+        }
+        match libublk::ctrl::UblkCtrl::new_simple(*id as i32) {
+            Ok(ctrl) => match ctrl.del_dev() {
+                Ok(_) => {
+                    removed += 1;
+                }
+                Err(e) => println!("device {id}: remove failed: {e}"),
+            },
+            Err(e) => println!("device {id}: cannot open control device: {e}"),
+        }
+    }
+    if dry_run {
+        println!("{} stale device(s); nothing removed (--dry-run)", ids.len());
+    } else {
+        println!("{} stale device(s) found, {removed} removed", ids.len());
     }
     Ok(())
 }

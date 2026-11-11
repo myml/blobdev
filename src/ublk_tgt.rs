@@ -224,7 +224,14 @@ fn spawn_drain_watcher(
                 // kernel removes the device when its handles close.
                 if exit_after.is_requested() {
                     log::info!("signal: exiting after flushing");
-                    std::process::exit(0);
+                    // `process::exit` runs atexit handlers and flushes the
+                    // stdio locks, which can block behind a logging thread
+                    // that never finishes -- the process logged "exiting" and
+                    // then sat there for as long as anyone watched. Every byte
+                    // that matters is already in the metadata and the object
+                    // store by now, so terminate immediately.
+                    // SAFETY: nothing below needs unwinding or cleanup.
+                    unsafe { libc::_exit(0) }
                 }
             }
             thread::sleep(Duration::from_millis(100));

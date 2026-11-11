@@ -528,23 +528,48 @@ impl Volume {
         let nblocks: usize = snap.chunks.values().map(|s| s.dirty.len()).sum();
         // Decide once which spelling this volume uses for uid-keyed objects:
         // `u<uid>` is current, `<uid>` is what volumes written before the
-        // prefix contain. Reading the wrong one finds nothing, so pick it from
-        // an object that is known to exist.
+        // prefix contain. Reading the wrong one finds nothing.
+        //
+        // Every uid-keyed object is checked, not just the first, and the
+        // majority wins. One lost object must not flip the decision for the
+        // whole volume -- that would turn a single missing object into a
+        // volume that reads back as zeros.
+        let mut current_only = 0u32;
+        let mut legacy_only = 0u32;
+        let mut both = 0u32;
+        let mut neither = Vec::new();
         for (id, st) in &snap.chunks {
-            if st.uploaded && st.uid != 0 {
-                let current = self.layout.chunk_key(st.uid);
-                let old = self.layout.legacy_chunk_key(st.uid as u64);
-                let has_current = self.data.stat(&current)?.is_some();
-                let has_old = self.data.stat(&old)?.is_some();
-                self.legacy_uid_keys = !has_current && has_old;
-                if !has_current && !has_old {
-                    log::warn!(
-                        "object {id}: neither {current} nor {old} exists; \
-                         the volume may have lost an object"
-                    );
-                }
-                break;
+            if !st.uploaded || st.uid == 0 {
+                continue;
             }
+            let has_current = self.data.stat(&self.layout.chunk_key(st.uid))?.is_some();
+            let has_old = self
+                .data
+                .stat(&self.layout.legacy_chunk_key(st.uid as u64))?
+                .is_some();
+            match (has_current, has_old) {
+                (true, false) => current_only += 1,
+                (false, true) => legacy_only += 1,
+                (true, true) => both += 1,
+                (false, false) => neither.push(*id),
+            }
+        }
+        self.legacy_uid_keys = legacy_only > current_only;
+        if !neither.is_empty() {
+            log::warn!(
+                "{} object(s) are missing from the store: {:?}",
+                neither.len(),
+                &neither[..neither.len().min(8)]
+            );
+        }
+        if both > 0 {
+            // Both spellings exist, which means a volume written before the
+            // prefix was read or written after it. Say so once, rather than
+            // silently preferring one.
+            log::warn!(
+                "{both} object(s) exist under both key spellings; using {}",
+                if self.legacy_uid_keys { "<uid>" } else { "u<uid>" }
+            );
         }
         // Every chunk present in the store has a committed object uid.
         for (id, st) in &snap.chunks {

@@ -831,3 +831,89 @@ fn a_uid_never_collides_with_an_object_index() {
     assert!(bad.is_empty(), "blocks lost to a key collision: {bad:?}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// One missing object must not make the whole volume unreadable.
+///
+/// The key spelling (`u<uid>` or the pre-prefix `<uid>`) is decided once when
+/// a volume opens. Deciding it from a single object means that object being
+/// lost flips the choice for every other object, and a volume with one bad
+/// object reads back as entirely zeros. The decision is made from all of them.
+#[test]
+fn a_single_missing_object_does_not_flip_the_key_spelling() {
+    let root = std::env::temp_dir().join(format!("blobdev-spell-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
+    let n = (obj_blocks * 6) as usize;
+    let mut data = vec![0u8; n * BLOCK as usize];
+    for b in 0..n {
+        data[b * BLOCK as usize..(b + 1) * BLOCK as usize].fill((b % 251) as u8);
+    }
+
+    let chunk_dir = objects.join("vol").join("c");
+    {
+        let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, n, &data).unwrap();
+        v.flush().unwrap();
+    }
+
+    // Rewrite the volume into the pre-prefix spelling, as an older blobdev
+    // would have left it, then delete one of them.
+    let mut keys: Vec<std::path::PathBuf> = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    keys.sort();
+    assert!(keys.len() >= 3, "need several objects, got {}", keys.len());
+    for k in &keys {
+        let name = k.file_name().unwrap().to_string_lossy().to_string();
+        if let Some(uid) = name.strip_prefix('u') {
+            std::fs::rename(k, chunk_dir.join(uid)).unwrap();
+        }
+    }
+    // Remove the first one by name; a probe that looks at one object sees a
+    // hole, and deciding the whole volume's spelling from it would make every
+    // other object unreadable too.
+    let mut legacy: Vec<std::path::PathBuf> = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    legacy.sort();
+    std::fs::remove_file(&legacy[0]).unwrap();
+
+    let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+
+    // The remaining objects must still be readable. The one that was removed
+    // reads as zeros -- that is expected and it is a single object's loss.
+    let mut got = vec![0u8; data.len()];
+    v.read(0, n, &mut got).unwrap();
+    let readable: Vec<u64> = (0..n as u64)
+        .filter(|b| got[(*b * BLOCK) as usize] == data[(*b * BLOCK) as usize])
+        .collect();
+    assert!(
+        readable.len() as u64 >= (n as u64 - obj_blocks),
+        "at most one object's worth of blocks should be lost, but only {} of {n} came back",
+        readable.len()
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

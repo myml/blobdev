@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use blobdev::meta::FileMeta;
+use blobdev::meta::{FileMeta, MetaStore};
 use blobdev::s3::{S3Config, S3Store};
 use blobdev::store::{DirStore, ObjectStore, Retry};
 use blobdev::webdav::{WebDavConfig, WebDavStore};
@@ -29,6 +29,9 @@ fn usage() -> ! {
   blobdev run --volume NAME --create-size SIZE [options]
   blobdev stop --id N
   blobdev status --id N
+  blobdev gc --volume NAME [--dry-run]   delete unreferenced chunk objects
+  blobdev ls --volume NAME               list the volume's chunk objects
+  blobdev inspect --volume NAME          check metadata against the store
 
 backends:
   --backend dir     --dir PATH
@@ -46,7 +49,7 @@ options:
   --full-pct N       upload a chunk when N% of its blocks are dirty (default 50)
   --max-age S        upload a chunk dirty for S seconds (default 30)
   --read-chunks N    clean chunks kept in memory (default 64)
-  --whole-chunk-pct N  fetch a whole chunk for reads covering N%% of it (default 25)
+  --whole-chunk-pct N  fetch a whole chunk for reads covering N% of it (default 25)
   --cache-dir PATH   keep clean chunks on local disk; enables read caching
   --cache-size SIZE  disk read cache budget, e.g. 20G (default 64M, 0 disables)
   --retries N        attempts per request on transient failures (default 4)"
@@ -92,6 +95,9 @@ fn real_main() -> Result<()> {
         "run" => run(&args),
         "stop" => stop(&args),
         "status" => status(&args),
+        "gc" => gc(&args),
+        "ls" => ls(&args),
+        "inspect" => inspect(&args),
         _ => usage(),
     }
 }
@@ -284,6 +290,102 @@ fn run(args: &[String]) -> Result<()> {
         interval: std::time::Duration::from_secs(1),
     };
     target.run(volume, drain, stop)
+}
+
+/// Show the metadata a volume would use, and whether it is consistent.
+fn inspect(args: &[String]) -> Result<()> {
+    let volume_name = arg(args, "--volume").context("--volume is required")?;
+    let meta_path = arg(args, "--meta")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{volume_name}.meta")));
+    let snap = match blobdev::meta::FileMeta::new(&meta_path).load()? {
+        Some(s) => s,
+        None => {
+            println!("no metadata at {}", meta_path.display());
+            return Ok(());
+        }
+    };
+    println!(
+        "volume {volume_name}: {} MiB, {} MiB chunks, {} chunk(s) recorded",
+        snap.geometry.size >> 20,
+        snap.geometry.chunk_size >> 20,
+        snap.chunks.len()
+    );
+    let store = build_store(args)?;
+    let mut missing = 0u64;
+    let mut ok = 0u64;
+    for (id, st) in &snap.chunks {
+        if !st.uploaded {
+            println!("  chunk {id}: not uploaded yet, {} dirty block(s)", st.dirty.len());
+            continue;
+        }
+        let key = format!("{volume_name}/c/{}", st.uid);
+        match store.stat(&key)? {
+            Some(size) => {
+                ok += 1;
+                if args.iter().any(|a| a == "--verbose") {
+                    println!("  chunk {id}: uid {} present, {size} bytes", st.uid);
+                }
+            }
+            None => {
+                missing += 1;
+                println!(
+                    "  chunk {id}: uid {} MISSING from the object store",
+                    st.uid
+                );
+            }
+        }
+    }
+    println!("{ok} object(s) present, {missing} missing");
+    if missing > 0 {
+        anyhow::bail!("metadata references objects that do not exist");
+    }
+    Ok(())
+}
+
+/// List the chunk objects of a volume, as the object store sees them.
+fn ls(args: &[String]) -> Result<()> {
+    let volume_name = arg(args, "--volume").context("--volume is required")?;
+    let store = build_store(args)?;
+    let prefix = format!("{volume_name}/c/");
+    let mut objs = store.list(&prefix)?;
+    objs.sort_by(|a, b| a.0.cmp(&b.0));
+    let total: u64 = objs.iter().map(|(_, s)| s).sum();
+    for (key, size) in &objs {
+        println!("{key}	{size}");
+    }
+    println!("{} object(s), {} MiB", objs.len(), total >> 20);
+    Ok(())
+}
+
+/// Delete chunk objects the metadata no longer references.
+fn gc(args: &[String]) -> Result<()> {
+    let volume_name = arg(args, "--volume").context("--volume is required")?;
+    let meta_path = arg(args, "--meta")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{volume_name}.meta")));
+    let dry_run = flag(args, "--dry-run");
+    let store = build_store(args)?;
+    let mut volume = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new(&volume_name),
+        None,
+        Policy::default(),
+    )?;
+    let report = volume.gc(dry_run)?;
+    println!(
+        "{} chunk object(s) live, {} orphaned ({} MiB){}",
+        report.kept,
+        report.orphaned,
+        report.bytes >> 20,
+        if dry_run {
+            "; dry run, nothing deleted".to_string()
+        } else {
+            format!("; {} deleted", report.deleted)
+        }
+    );
+    Ok(())
 }
 
 fn stop(args: &[String]) -> Result<()> {

@@ -182,6 +182,19 @@ impl Fetcher {
     }
 }
 
+/// What a garbage collection found and did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Objects still referenced by the metadata.
+    pub kept: u64,
+    /// Objects nothing references.
+    pub orphaned: u64,
+    /// Orphans actually removed (0 for a dry run).
+    pub deleted: u64,
+    /// Bytes held by the orphans.
+    pub bytes: u64,
+}
+
 /// One fetch the object store has to perform for a planned read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
@@ -969,6 +982,72 @@ impl Volume {
 
     pub fn sent_bytes(&self) -> u64 {
         self.sent_bytes
+    }
+
+    /// Delete chunk objects that the metadata no longer references.
+    ///
+    /// Writing a new object and committing the pointer is two steps; a crash
+    /// between them leaves the new object orphaned. Those objects are
+    /// unreachable but still billed, so this reports what it found.
+    ///
+    /// Only runs when nothing is dirty: an in-flight upload owns objects the
+    /// metadata does not point at yet.
+    pub fn gc(&mut self, dry_run: bool) -> Result<GcReport> {
+        if !self.working.is_empty() {
+            anyhow::bail!(
+                "refusing to collect garbage with {} chunk(s) still pending upload",
+                self.working.len()
+            );
+        }
+        if self.caps.partial_write {
+            // Objects are patched in place and named by chunk index, so there
+            // is nothing orphaned to reclaim.
+            return Ok(GcReport::default());
+        }
+
+        let prefix = format!("{}/c/", self.layout.root);
+        let live: std::collections::BTreeSet<String> = self
+            .uids
+            .values()
+            .map(|uid| self.layout.chunk_key(*uid))
+            .collect();
+
+        let listing = self.data.list(&prefix)?;
+        let present: std::collections::BTreeSet<&str> =
+            listing.iter().map(|(k, _)| k.as_str()).collect();
+
+        // If the metadata points at an object that is not there, the volume is
+        // already inconsistent (restored metadata, manual deletion, a backend
+        // that lost data). Deleting anything now would only make it worse, and
+        // it would remove the evidence.
+        let mut missing: Vec<String> = live
+            .iter()
+            .filter(|k| !present.contains(k.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            anyhow::bail!(
+                "metadata references {} object(s) that are missing, refusing to delete anything: {}",
+                missing.len(),
+                missing.join(", ")
+            );
+        }
+
+        let mut report = GcReport::default();
+        for (key, size) in listing {
+            if live.contains(&key) {
+                report.kept += 1;
+                continue;
+            }
+            report.orphaned += 1;
+            report.bytes += size;
+            if !dry_run {
+                self.data.delete(&key)?;
+                report.deleted += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// How many reads used a byte-range fetch rather than a whole chunk.

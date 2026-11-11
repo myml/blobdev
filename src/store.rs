@@ -81,6 +81,16 @@ pub trait ObjectStore: Send + Sync {
 
     fn delete(&self, key: &str) -> Result<()>;
 
+    /// List keys under `prefix`.
+    ///
+    /// Used to find objects nothing references any more (a crash between
+    /// writing a new chunk and committing the metadata leaves one behind).
+    /// Backends that cannot list return an empty vector.
+    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let _ = prefix;
+        Ok(Vec::new())
+    }
+
     /// Human-readable backend name, for logs.
     fn name(&self) -> &str {
         "object store"
@@ -165,6 +175,40 @@ impl ObjectStore for DirStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).context("delete object"),
         }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            prefix: &str,
+            out: &mut Vec<(String, u64)>,
+        ) -> Result<()> {
+            let Ok(rd) = fs::read_dir(dir) else {
+                return Ok(());
+            };
+            for entry in rd {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, prefix, out)?;
+                    continue;
+                }
+                let Ok(rel) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let key = rel.to_string_lossy().replace('\\', "/");
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push((key, size));
+            }
+            Ok(())
+        }
+        walk(&self.root, &self.root, prefix, &mut out)?;
+        Ok(out)
     }
 
     fn name(&self) -> &str {
@@ -255,6 +299,17 @@ impl ObjectStore for MemStore {
     fn delete(&self, key: &str) -> Result<()> {
         self.objects.lock().unwrap().remove(key);
         Ok(())
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.len() as u64))
+            .collect())
     }
 
     fn name(&self) -> &str {

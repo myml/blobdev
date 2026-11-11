@@ -210,6 +210,20 @@ pub fn encode_path(s: &str) -> String {
     out
 }
 
+/// Percent-encode a *query parameter* value, encoding `/` too.
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if is_unreserved(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Build the canonical URI from its already-decoded segments. Each segment is
 /// encoded separately so a `/` inside a segment cannot forge a hierarchy.
 fn canonical_uri(segments: &[&str]) -> String {
@@ -724,6 +738,56 @@ impl S3Store {
     /// accepts both. The trailing slash is the spelling every S3
     /// implementation understands, so the probe uses it; this also checks
     /// that the server takes the bucket from the path rather than the host.
+    /// List objects under `prefix`, following continuation tokens.
+    pub fn list_objects(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            // SigV4 signs the canonical query, which must be sorted by
+            // parameter name and encoded per RFC 3986 on both sides.
+            let mut params: Vec<(String, String)> = vec![
+                ("encoding-type".to_string(), "url".to_string()),
+                ("list-type".to_string(), "2".to_string()),
+                ("prefix".to_string(), prefix.to_string()),
+            ];
+            if let Some(t) = &token {
+                params.push(("continuation-token".to_string(), t.clone()));
+            }
+            params.sort();
+            let query = params
+                .iter()
+                .map(|(k, v)| format!("{}={}", encode_query_value(k), encode_query_value(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            let (uri, host) = self.target_at("", false)?;
+            let uri = format!("{uri}/");
+            let headers = vec![("host".to_string(), host)];
+            let now = Self::now_amz_date()?;
+            let signed = sign(&self.cfg, "GET", &uri, &query, headers, EMPTY_SHA256, &now)?;
+            let reply = self.send(&signed, &[])?;
+            if reply.status != 200 {
+                return Err(http_error("GET", &format!("{uri}?{query}"), &reply));
+            }
+            log::debug!(
+                "listing {uri}?{query}: {} bytes, {} items",
+                reply.body.len(),
+                parse_listing(&String::from_utf8_lossy(&reply.body)).len()
+            );
+            let body = String::from_utf8_lossy(&reply.body);
+            for (key, size) in parse_listing(&body) {
+                out.push((key, size));
+            }
+            match next_token(&body) {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+            if out.len() > 1_000_000 {
+                anyhow::bail!("listing {prefix} returned more than a million objects");
+            }
+        }
+        Ok(out)
+    }
+
     pub fn check_bucket(&self) -> Result<()> {
         // The bucket itself, not the prefix: `target("")` appends the prefix
         // when one is configured, which would list a nonexistent object.
@@ -841,6 +905,14 @@ impl ObjectStore for S3Store {
             .run(&format!("DELETE {key}"), || self.delete_object(key))
     }
 
+    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        // The caller's prefix is relative to the volume root, which may sit
+        // under a bucket-wide key prefix.
+        let full = self.key(prefix);
+        self.retry
+            .run(&format!("LIST {full}"), || self.list_objects(&full))
+    }
+
     fn name(&self) -> &str {
         "s3"
     }
@@ -850,6 +922,60 @@ impl ObjectStore for S3Store {
 // Tests. No network: canonicalisation and signing are checked as pure
 // functions against the vectors in the AWS SigV4 documentation.
 // ---------------------------------------------------------------------------
+
+
+/// Extract `(key, size)` pairs from a ListObjectsV2 response.
+///
+/// Keys come back percent-encoded because the request asks for
+/// `encoding-type=url`, so they are decoded here.
+fn parse_listing(body: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<Contents>") {
+        let after = &rest[start + "<Contents>".len()..];
+        let Some(end) = after.find("</Contents>") else {
+            break;
+        };
+        let item = &after[..end];
+        let key = between(item, "<Key>", "</Key>").map(percent_decode);
+        let size = between(item, "<Size>", "</Size>").and_then(|v| v.parse::<u64>().ok());
+        if let (Some(k), Some(sz)) = (key, size) {
+            out.push((k, sz));
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+fn next_token(body: &str) -> Option<String> {
+    between(body, "<NextContinuationToken>", "</NextContinuationToken>").map(percent_decode)
+}
+
+fn between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = hay.find(open)? + open.len();
+    let end = hay[start..].find(close)? + start;
+    Some(&hay[start..end])
+}
+
+/// Decode the percent-encoding S3 applies with `encoding-type=url`.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 #[cfg(test)]
 mod tests {

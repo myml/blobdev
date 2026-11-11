@@ -492,3 +492,215 @@ fn superseded_objects_are_deleted() {
     assert_eq!(buf[0], 3);
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Garbage collection must remove orphaned chunk objects and nothing else.
+#[test]
+fn gc_removes_only_orphans() {
+    /// DirStore with partial writes disabled: S3 semantics, which is the only
+    /// case that can leave orphaned objects behind.
+    struct S3Like(DirStore);
+    impl ObjectStore for S3Like {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.0.stat(key)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<std::ops::Range<u64>>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.0.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.0.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key)
+        }
+        fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+            self.0.list(prefix)
+        }
+    }
+
+    let root = tmpdir("gc");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = 2 * DEFAULT_CHUNK;
+
+    // Two chunks committed normally.
+    {
+        let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(size)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, 1, &blocks(1, 0x01)).unwrap();
+        v.write((DEFAULT_CHUNK / BLOCK) + 5, 1, &blocks(1, 0x02))
+            .unwrap();
+        v.flush().unwrap();
+    }
+
+    let chunk_dir = objects.join("vol").join("c");
+    let live_before: std::collections::BTreeSet<String> = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(live_before.len(), 2, "expected two live objects");
+
+    // Simulate a crash between writing a new object and committing it.
+    std::fs::write(chunk_dir.join("9999"), vec![0u8; 4096]).unwrap();
+
+    let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+
+    // A dry run reports without touching anything.
+    let dry = v.gc(true).unwrap();
+    assert_eq!(dry.orphaned, 1, "the stray object should be found");
+    assert_eq!(dry.deleted, 0);
+    assert_eq!(dry.kept, 2);
+    assert!(chunk_dir.join("9999").exists(), "dry run deleted something");
+
+    // A real run removes only the orphan.
+    let real = v.gc(false).unwrap();
+    assert_eq!(real.orphaned, 1);
+    assert_eq!(real.deleted, 1);
+    assert!(!chunk_dir.join("9999").exists());
+
+    let after: std::collections::BTreeSet<String> = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(after, live_before, "gc must not touch live objects");
+
+    // Data is still intact after the collection.
+    drop(v);
+    let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    let mut buf = vec![0u8; BLOCK as usize];
+    v.read(0, 1, &mut buf).unwrap();
+    assert_eq!(buf[0], 0x01);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Collection is refused while chunks are still waiting to be uploaded,
+/// because those own objects the metadata does not reference yet.
+#[test]
+fn gc_refuses_with_pending_uploads() {
+    let root = tmpdir("gcpending");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let store = Arc::new(DirStore::new(&objects).unwrap());
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        Some(Create::new(DEFAULT_CHUNK)),
+        Policy::default(),
+    )
+    .unwrap();
+    v.write(0, 1, &blocks(1, 0x09)).unwrap();
+    let err = match v.gc(false) {
+        Ok(_) => panic!("gc should refuse while uploads are pending"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("pending"), "unhelpful error: {err}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Collection must refuse to run when the metadata points at a missing
+/// object: deleting the "unreferenced" ones would then destroy the only
+/// remaining evidence and any data that is still reachable.
+#[test]
+fn gc_refuses_when_metadata_references_a_missing_object() {
+    struct S3Like(DirStore);
+    impl ObjectStore for S3Like {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.0.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.0.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.0.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key)
+        }
+        fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+            self.0.list(prefix)
+        }
+    }
+
+    let root = tmpdir("gcmiss");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = 2 * DEFAULT_CHUNK;
+
+    {
+        let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(size)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, 1, &blocks(1, 0x77)).unwrap();
+        v.flush().unwrap();
+    }
+
+    // Take one referenced object away behind the volume's back.
+    let chunk_dir = objects.join("vol").join("c");
+    let victim = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_file())
+        .expect("a chunk object");
+    std::fs::remove_file(&victim).unwrap();
+
+    let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    let err = match v.gc(false) {
+        Ok(r) => panic!("gc should have refused, but reported {r:?}"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("missing"),
+        "the error should name the problem: {err}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

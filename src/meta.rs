@@ -450,3 +450,49 @@ mod tests {
         assert_eq!(odd.chunk_len(2), 4 << 20);
     }
 }
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    /// How big does the metadata get for a realistically sized volume?
+    ///
+    /// It is rewritten whole on every write, so its size is the write
+    /// amplification of the metadata path: 1 TiB with every object dirty means
+    /// 4.5 MB of file per 4 KiB block written.
+    #[test]
+    fn metadata_size_for_a_large_volume() {
+        for size_gib in [64u64, 256, 1024, 4096] {
+            let size = size_gib << 30;
+            let object_size = 4u64 << 20;
+            let geometry = Geometry {
+                chunk_size: 64 << 20,
+                object_size,
+                size,
+            };
+            let objects = size.div_ceil(object_size);
+            let mut snap = Snapshot::new(geometry);
+            for id in 0..objects {
+                snap.chunks.insert(
+                    id,
+                    ChunkState {
+                        dirty: BTreeMap::new(),
+                        uploaded: true,
+                        uid: 1,
+                    },
+                );
+            }
+            let clean = snap.encode().len();
+            // Worst case: every object has one dirty block.
+            for st in snap.chunks.values_mut() {
+                st.dirty.insert(0, ());
+            }
+            let dirty = snap.encode().len();
+            println!(
+                "{size_gib:>5} GiB: {objects:>7} objects, {} KiB clean, {} KiB with a dirty block",
+                clean >> 10,
+                dirty >> 10
+            );
+        }
+    }
+}

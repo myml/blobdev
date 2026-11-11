@@ -775,6 +775,9 @@ impl Volume {
             done += n;
             off += n as u64;
         }
+        // The dirty-block record has to outlive the process even if it is
+        // killed before the next flush, so every write commits it. That is
+        // deliberate: see the note on metadata cost in the README.
         self.save_meta()
     }
 
@@ -1083,6 +1086,9 @@ impl Volume {
         if ready.is_empty() {
             return Ok(());
         }
+        if ready.is_empty() {
+            return Ok(());
+        }
         for id in ready {
             self.upload(id)?;
         }
@@ -1101,6 +1107,36 @@ impl Volume {
 
     pub fn cached_chunks(&self) -> usize {
         self.read_cache.len()
+    }
+
+    /// One line describing what the volume is doing, for the periodic log.
+    ///
+    /// Long runs have no other window into the process: these are the numbers
+    /// that say whether it is keeping up (dirty blocks draining), whether the
+    /// cache is working (hit rate, disk usage) and how much has been sent.
+    pub fn summary(&self) -> String {
+        let sent = self.sent_bytes;
+        let (sent_disp, unit) = if sent >= 1 << 30 {
+            (sent as f64 / (1u64 << 30) as f64, "GiB")
+        } else {
+            (sent as f64 / (1u64 << 20) as f64, "MiB")
+        };
+        let mut out = format!(
+            "dirty {} chunk(s)/{} block(s), cached {}/{}, sent {sent_disp:.1} {unit} in {} upload(s)",
+            self.working.len(),
+            self.dirty_blocks(),
+            self.read_cache.len(),
+            self.read_cache.capacity,
+            self.sent_chunks,
+        );
+        if let Some((used, cap)) = self.disk_cache_usage() {
+            out.push_str(&format!(
+                ", disk cache {}/{} MiB",
+                used >> 20,
+                cap >> 20
+            ));
+        }
+        out
     }
 
     /// Maximum number of clean chunks held in memory.

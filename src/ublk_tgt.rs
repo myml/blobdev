@@ -165,6 +165,18 @@ fn spawn_maintenance(
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     let handle = thread::spawn(move || {
+        // A long run otherwise has no window into the daemon at all. One line
+        // every few minutes says whether uploads are draining, whether the
+        // cache is doing its job, and how much has been sent.
+        // Default ten minutes; BLOBDEV_SUMMARY_SECS overrides it, which is how
+        // the periodic line is exercised in tests without a long run.
+        let summary_every = std::env::var("BLOBDEV_SUMMARY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(600));
+        let mut last_summary = std::time::Instant::now();
         while !s.load(Ordering::SeqCst) {
             {
                 let (lock, cvar) = &*wake;
@@ -177,6 +189,10 @@ fn spawn_maintenance(
             let mut v = volume.lock().unwrap_or_else(|p| p.into_inner());
             if let Err(e) = v.tick() {
                 log::error!("upload: {e:#}");
+            }
+            if last_summary.elapsed() >= summary_every {
+                last_summary = std::time::Instant::now();
+                log::info!("{}", v.summary());
             }
         }
     });

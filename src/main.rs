@@ -367,7 +367,14 @@ fn inspect(args: &[String]) -> Result<()> {
             println!("  chunk {id}: not uploaded yet, {} dirty block(s)", st.dirty.len());
             continue;
         }
-        let key = format!("{volume_name}/c/{}", st.uid);
+        // uid 0 marks an object patched in place and keyed by its index; it is
+        // not a real uid. Treating it as one names object 0, so every patched
+        // object would be reported as missing while the objects sit there.
+        let key = if st.uid == 0 {
+            format!("{volume_name}/c/{id}")
+        } else {
+            format!("{volume_name}/c/{}", st.uid)
+        };
         match store.stat(&key)? {
             Some(size) => {
                 ok += 1;

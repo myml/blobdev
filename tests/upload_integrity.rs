@@ -581,7 +581,7 @@ fn a_backend_that_cannot_patch_is_asked_only_once() {
         fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
             self.inner.put(key, data)
         }
-        fn patch(&self, key: &str, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+        fn patch(&self, _key: &str, _offset: u64, _data: &[u8]) -> anyhow::Result<()> {
             self.patches.fetch_add(1, Ordering::SeqCst);
             self.refuses.store(true, Ordering::SeqCst);
             anyhow::bail!("partial write not supported by this server")

@@ -771,7 +771,8 @@ impl ObjectStore for WebDavStore {
             partial_write: !self
                 .no_ranged_write
                 .load(std::sync::atomic::Ordering::SeqCst),
-            conditional_write: true,
+            // WebDAV has no conditional PUT that is portable enough to rely on.
+            conditional_write: false,
         }
     }
 

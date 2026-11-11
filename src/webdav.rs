@@ -32,7 +32,7 @@ use std::io::Read;
 use std::ops::Range;
 use std::time::Duration;
 
-use crate::store::{Caps, ObjectStore, ETag};
+use crate::store::{Caps, ObjectStore, Retry, StoreError, ETag};
 
 /// Connection settings for a WebDAV server.
 #[derive(Clone)]
@@ -332,6 +332,8 @@ impl Reply {
 
 /// A blocking WebDAV client.
 pub struct WebDavStore {
+    /// Retry policy for transient failures.
+    retry: Retry,
     cfg: WebDavConfig,
     /// Normalised base URL without a trailing `/`.
     base: String,
@@ -361,11 +363,18 @@ impl WebDavStore {
             .timeout_global(cfg.timeout)
             .build();
         Ok(WebDavStore {
+            retry: Retry::default(),
             cfg,
             base,
             auth,
             agent: config.into(),
         })
+    }
+
+    /// Replace the retry policy (1 attempt disables retrying).
+    pub fn with_retry(mut self, retry: Retry) -> WebDavStore {
+        self.retry = retry;
+        self
     }
 
     /// Absolute URL for a key; useful in logs and tests.
@@ -654,28 +663,42 @@ impl ObjectStore for WebDavStore {
     }
 
     fn stat(&self, key: &str) -> Result<Option<u64>> {
-        Ok(self.head(key)?.map(|(len, _)| len))
+        self.retry
+            .run(&format!("HEAD {key}"), || Ok(self.head(key)?.map(|(len, _)| len)))
     }
 
     fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Vec<u8>> {
-        self.fetch(key, range)
+        self.retry
+            .run(&format!("GET {key}"), || self.fetch(key, range.clone()))
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<Option<ETag>> {
-        self.store_whole(key, data)
+        self.retry
+            .run(&format!("PUT {key}"), || self.store_whole(key, data))
     }
 
     fn patch(&self, key: &str, offset: u64, data: &[u8]) -> Result<()> {
-        self.store_range(key, offset, data)
+        self.retry.run(&format!("PATCH {key}@{offset}"), || {
+            self.store_range(key, offset, data)
+        })
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let url = self.url_for(key);
-        let reply = self.request("DELETE", &url, &[], None)?;
-        match reply.status {
-            200 | 202 | 204 | 404 | 410 => Ok(()),
-            _ => anyhow::bail!("DELETE {url}: {}", reply.describe()),
-        }
+        self.retry.run(&format!("DELETE {key}"), || {
+            let url = self.url_for(key);
+            let reply = self.request("DELETE", &url, &[], None)?;
+            match reply.status {
+                200 | 202 | 204 | 404 | 410 => Ok(()),
+                _ if reply.status >= 500 => Err(StoreError::transient(format!(
+                    "DELETE {url}: {}",
+                    reply.describe()
+                ))),
+                _ => Err(StoreError::permanent(format!(
+                    "DELETE {url}: {}",
+                    reply.describe()
+                ))),
+            }
+        })
     }
 
     fn name(&self) -> &str {

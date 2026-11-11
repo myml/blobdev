@@ -264,3 +264,218 @@ impl ObjectStore for MemStore {
 
 #[allow(dead_code)]
 fn _unused(_: &Path) {}
+
+// ---------------------------------------------------------------------------
+// Retries
+// ---------------------------------------------------------------------------
+
+/// How aggressively to retry a failed request.
+#[derive(Debug, Clone, Copy)]
+pub struct Retry {
+    /// Total attempts, including the first one. 1 disables retrying.
+    pub attempts: u32,
+    /// First backoff; doubles on each further retry.
+    pub base_delay: std::time::Duration,
+    /// Cap on a single backoff.
+    pub max_delay: std::time::Duration,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Retry {
+            attempts: 4,
+            base_delay: std::time::Duration::from_millis(200),
+            max_delay: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+impl Retry {
+    pub fn none() -> Retry {
+        Retry {
+            attempts: 1,
+            ..Retry::default()
+        }
+    }
+
+    /// Delay before attempt `n` (1-based); `None` when out of attempts.
+    pub fn delay(&self, attempt: u32) -> Option<std::time::Duration> {
+        if attempt >= self.attempts {
+            return None;
+        }
+        let factor = 1u32 << (attempt.saturating_sub(1)).min(10);
+        let d = self.base_delay.saturating_mul(factor);
+        Some(d.min(self.max_delay))
+    }
+
+    /// Run `f` until it succeeds, it fails with a permanent error, or the
+    /// attempts run out.
+    ///
+    /// Only operations that are safe to repeat should go through this: a PUT
+    /// of a fixed object and a GET are, while anything with a side effect that
+    /// is not idempotent must not be retried blindly. In this code base every
+    /// object write publishes a whole new object, so repeats are harmless.
+    pub fn run<T>(&self, what: &str, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+        let mut attempt = 1u32;
+        loop {
+            match f() {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let retryable = is_transient(&e);
+                    match self.delay(attempt) {
+                        Some(d) if retryable => {
+                            log::warn!(
+                                "{what}: attempt {attempt}/{} failed ({e:#}); retrying in {d:?}",
+                                self.attempts
+                            );
+                            std::thread::sleep(d);
+                            attempt += 1;
+                        }
+                        _ => {
+                            if retryable && attempt > 1 {
+                                return Err(e).with_context(|| {
+                                    format!("{what}: gave up after {attempt} attempts")
+                                });
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A backend failure, classified so the retry loop can decide.
+#[derive(Debug)]
+pub struct StoreError {
+    pub message: String,
+    /// True when the request may succeed if repeated (network hiccup, 5xx,
+    /// throttling, timeout).
+    pub transient: bool,
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl StoreError {
+    /// A failure worth retrying.
+    pub fn transient(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(StoreError {
+            message: message.into(),
+            transient: true,
+        })
+    }
+
+    /// A failure that will not fix itself (bad credentials, missing bucket).
+    pub fn permanent(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(StoreError {
+            message: message.into(),
+            transient: false,
+        })
+    }
+}
+
+/// Whether an error, or any error in its context chain, is worth retrying.
+pub fn is_transient(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<StoreError>()
+            .map(|s| s.transient)
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn retries_transient_failures() {
+        let r = Retry {
+            attempts: 4,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(2),
+        };
+        let n = AtomicU32::new(0);
+        let out: Result<u32> = r.run("op", || {
+            let c = n.fetch_add(1, Ordering::SeqCst) + 1;
+            if c < 3 {
+                Err(StoreError::transient("boom"))
+            } else {
+                Ok(c)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+        assert_eq!(n.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn permanent_failures_are_not_retried() {
+        let r = Retry {
+            attempts: 8,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(2),
+        };
+        let n = AtomicU32::new(0);
+        let out: Result<u32> = r.run("op", || {
+            n.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::permanent("403 Forbidden"))
+        });
+        assert!(out.is_err());
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            1,
+            "a permanent error must fail on the first attempt"
+        );
+    }
+
+    #[test]
+    fn retries_stop_after_the_budget() {
+        let r = Retry {
+            attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(2),
+        };
+        let n = AtomicU32::new(0);
+        let out: Result<u32> = r.run("op", || {
+            n.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::transient("still down"))
+        });
+        let msg = format!("{:#}", out.unwrap_err());
+        assert_eq!(n.load(Ordering::SeqCst), 3);
+        assert!(msg.contains("gave up"), "unhelpful error: {msg}");
+    }
+
+    #[test]
+    fn transient_survives_context() {
+        let e = StoreError::transient("network");
+        let wrapped = e.context("uploading chunk 3");
+        assert!(is_transient(&wrapped));
+        assert!(!is_transient(&anyhow::anyhow!("plain error")));
+        assert!(!is_transient(&StoreError::permanent("nope")));
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        let r = Retry {
+            attempts: 10,
+            base_delay: std::time::Duration::from_millis(100),
+            max_delay: std::time::Duration::from_millis(500),
+        };
+        assert_eq!(r.delay(1), Some(std::time::Duration::from_millis(100)));
+        assert_eq!(r.delay(2), Some(std::time::Duration::from_millis(200)));
+        assert_eq!(r.delay(3), Some(std::time::Duration::from_millis(400)));
+        assert_eq!(
+            r.delay(4),
+            Some(std::time::Duration::from_millis(500)),
+            "must cap at max_delay"
+        );
+        assert_eq!(r.delay(10), None, "no delay once attempts are exhausted");
+    }
+}

@@ -30,7 +30,7 @@ use std::fmt;
 use std::ops::Range;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::store::{Caps, ObjectStore, ETag};
+use crate::store::{Caps, ObjectStore, StoreError, ETag};
 
 const SERVICE: &str = "s3";
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -364,11 +364,26 @@ fn http_error(method: &str, path: &str, reply: &Reply) -> anyhow::Error {
             msg.push_str(&text.chars().take(200).collect::<String>());
         }
     }
-    anyhow::anyhow!(msg)
+    // 5xx server errors, 429 throttling and 408 timeouts may pass on a retry.
+    // SlowDown / InternalError come back as other codes with a 4xx status.
+    let code = s3_error_code(&reply.body).unwrap_or_default();
+    let transient = matches!(reply.status, 500 | 502 | 503 | 504 | 408 | 429)
+        || matches!(
+            code.as_str(),
+            "SlowDown" | "InternalError" | "ServiceUnavailable" | "RequestTimeout"
+                | "ThrottlingException" | "RequestTimeTooSkewed"
+        );
+    if transient {
+        StoreError::transient(msg)
+    } else {
+        StoreError::permanent(msg)
+    }
 }
 
 /// A blocking, SigV4-signing S3 client.
 pub struct S3Store {
+    /// Retry policy for transient failures.
+    retry: crate::store::Retry,
     cfg: S3Config,
     ep: Endpoint,
     agent: ureq::Agent,
@@ -389,7 +404,18 @@ impl S3Store {
             .max_redirects(0)
             .build()
             .into();
-        Ok(S3Store { cfg, ep, agent })
+        Ok(S3Store {
+            cfg,
+            ep,
+            agent,
+            retry: crate::store::Retry::default(),
+        })
+    }
+
+    /// Replace the retry policy (1 attempt disables retrying).
+    pub fn with_retry(mut self, retry: crate::store::Retry) -> S3Store {
+        self.retry = retry;
+        self
     }
 
     /// The object key as seen in the bucket, prefix included.
@@ -531,7 +557,9 @@ impl S3Store {
         // Keep what arrived even if the server closed early; the status wins.
         if let Err(e) = read {
             if status == 200 {
-                return Err(e).with_context(|| format!("read response body of {url}"));
+                return Err(StoreError::transient(format!(
+                    "read response body of {url}: {e}"
+                )));
             }
         }
         Ok(Reply {
@@ -784,7 +812,9 @@ impl ObjectStore for S3Store {
     }
 
     fn stat(&self, key: &str) -> Result<Option<u64>> {
-        Ok(self.head_object(key)?.map(|(len, _)| len))
+        self.retry.run(&format!("HEAD {key}"), || {
+            Ok(self.head_object(key)?.map(|(len, _)| len))
+        })
     }
 
     fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Vec<u8>> {
@@ -792,18 +822,23 @@ impl ObjectStore for S3Store {
         // `stat`, whether a short read is an error or just zeros. Return the
         // empty object rather than failing so a race with `delete` reads as a
         // hole too.
-        self.get_object(key, range)
+        self.retry
+            .run(&format!("GET {key}"), || self.get_object(key, range.clone()))
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<Option<ETag>> {
-        self.put_object(key, data)
+        // Safe to repeat: chunk objects are new keys on every upload, and a
+        // metadata write is a full replacement of the same content.
+        self.retry
+            .run(&format!("PUT {key}"), || self.put_object(key, data))
     }
 
     // `patch` is intentionally not overridden: `Caps::S3` says
     // `partial_write: false`, and the trait default reports exactly that.
 
     fn delete(&self, key: &str) -> Result<()> {
-        self.delete_object(key)
+        self.retry
+            .run(&format!("DELETE {key}"), || self.delete_object(key))
     }
 
     fn name(&self) -> &str {

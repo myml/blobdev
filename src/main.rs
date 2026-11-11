@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use blobdev::meta::FileMeta;
 use blobdev::s3::{S3Config, S3Store};
-use blobdev::store::{DirStore, ObjectStore};
+use blobdev::store::{DirStore, ObjectStore, Retry};
 use blobdev::webdav::{WebDavConfig, WebDavStore};
 use blobdev::volume::{Create, DiskCache, Layout, Policy, Volume};
 
@@ -47,8 +47,9 @@ options:
   --max-age S        upload a chunk dirty for S seconds (default 30)
   --read-chunks N    clean chunks kept in memory (default 64)
   --whole-chunk-pct N  fetch a whole chunk for reads covering N%% of it (default 25)
-  --cache-dir PATH   keep clean chunks on local disk (needs --cache-size)
-  --cache-size SIZE  disk read cache budget, e.g. 20G (0 disables)"
+  --cache-dir PATH   keep clean chunks on local disk; enables read caching
+  --cache-size SIZE  disk read cache budget, e.g. 20G (default 64M, 0 disables)
+  --retries N        attempts per request on transient failures (default 4)"
     );
     std::process::exit(2)
 }
@@ -95,6 +96,14 @@ fn real_main() -> Result<()> {
     }
 }
 
+/// A sensible read cache budget when `--cache-size` is not given: a slice of
+/// the volume size, so a small volume is cached whole and a large one keeps a
+/// working fraction. Never smaller than 64 MiB.
+fn default_cache_budget() -> u64 {
+    const MIN: u64 = 64 << 20;
+    MIN
+}
+
 fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
     let backend = arg(args, "--backend").unwrap_or_else(|| "dir".to_string());
     match backend.as_str() {
@@ -122,7 +131,14 @@ fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
             }
             // Session tokens are for temporary credentials; wire them once the
             // backend exposes a setter.
-            let store = S3Store::new(cfg)?;
+            let mut store = S3Store::new(cfg)?;
+            if let Some(n) = arg(args, "--retries") {
+                let attempts: u32 = n.parse().context("bad --retries")?;
+                store = store.with_retry(Retry {
+                    attempts: attempts.max(1),
+                    ..Retry::default()
+                });
+            }
             store.check_bucket()?;
             Ok(Arc::new(store))
         }
@@ -135,7 +151,15 @@ fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
             if let Some(p) = arg(args, "--key-prefix") {
                 cfg = cfg.with_prefix(p);
             }
-            Ok(Arc::new(WebDavStore::new(cfg)?))
+            let mut store = WebDavStore::new(cfg)?;
+            if let Some(n) = arg(args, "--retries") {
+                let attempts: u32 = n.parse().context("bad --retries")?;
+                store = store.with_retry(Retry {
+                    attempts: attempts.max(1),
+                    ..Retry::default()
+                });
+            }
+            Ok(Arc::new(store))
         }
         other => anyhow::bail!("unknown backend {other}"),
     }
@@ -185,9 +209,27 @@ fn run(args: &[String]) -> Result<()> {
             .unwrap_or(25),
     };
 
+    // Data written through the device is already on local disk on its way out;
+    // keeping it is what makes a restart start warm. So a cache directory also
+    // implies a cache, and the budget defaults rather than being mandatory.
     let disk_cache = match (arg(args, "--cache-dir"), arg(args, "--cache-size")) {
-        (Some(dir), Some(sz)) => Some(DiskCache::new(dir, parse_size(&sz)?)),
-        (Some(_), None) => anyhow::bail!("--cache-dir needs --cache-size, e.g. --cache-size 20G"),
+        (Some(dir), Some(sz)) => {
+            let bytes = parse_size(&sz)?;
+            if bytes == 0 {
+                None
+            } else {
+                Some(DiskCache::new(dir, bytes))
+            }
+        }
+        (Some(dir), None) => {
+            let budget = default_cache_budget();
+            log::info!(
+                "read cache: {} with the default budget of {} MiB (set --cache-size)",
+                dir,
+                budget >> 20
+            );
+            Some(DiskCache::new(dir, budget))
+        }
         (None, Some(_)) => anyhow::bail!("--cache-size needs --cache-dir"),
         (None, None) => None,
     };

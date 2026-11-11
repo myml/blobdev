@@ -95,6 +95,118 @@ impl Default for Policy {
     }
 }
 
+/// Fetches chunks without needing the volume lock.
+#[derive(Clone)]
+pub struct Fetcher {
+    data: Arc<dyn ObjectStore>,
+    layout: Layout,
+    geometry: Geometry,
+    caps: Caps,
+    uids: HashMap<u64, u32>,
+}
+
+impl Fetcher {
+    fn object_key(&self, id: u64) -> String {
+        match self.uids.get(&id) {
+            Some(uid) => self.layout.chunk_key(*uid),
+            None => self.layout.legacy_chunk_key(id),
+        }
+    }
+
+    /// Execute one planned fetch.
+    pub fn fetch(&self, req: &FetchRequest) -> Result<Vec<u8>> {
+        if req.whole {
+            self.fetch_whole(req.chunk, req.len)
+        } else {
+            self.fetch_range(req.chunk, req.start, req.len)
+        }
+    }
+
+    fn fetch_whole(&self, id: u64, len: u64) -> Result<Vec<u8>> {
+        let key = self.object_key(id);
+        let mut v = match self.data.get(&key, None) {
+            Ok(v) => v,
+            Err(e) => {
+                if self.data.stat(&key)?.is_none() {
+                    vec![0u8; len as usize]
+                } else {
+                    return Err(e).with_context(|| format!("fetch chunk {id}"));
+                }
+            }
+        };
+        v.resize(len as usize, 0);
+        v.truncate(len as usize);
+        Ok(v)
+    }
+
+    fn fetch_range(&self, id: u64, start: u64, want: u64) -> Result<Vec<u8>> {
+        let key = self.object_key(id);
+        let chunk_len = self.geometry.chunk_len(id);
+        if start >= chunk_len {
+            return Ok(vec![0u8; want as usize]);
+        }
+        let end = (start + want).min(chunk_len);
+        let n = (end - start) as usize;
+
+        if !self.caps.range_read {
+            let mut whole = match self.data.get(&key, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    if self.data.stat(&key)?.is_none() {
+                        return Ok(vec![0u8; want as usize]);
+                    }
+                    return Err(e).with_context(|| format!("fetch chunk {id}"));
+                }
+            };
+            whole.resize(chunk_len as usize, 0);
+            let mut out = vec![0u8; want as usize];
+            let avail = (whole.len() as u64).saturating_sub(start).min(n as u64) as usize;
+            out[..avail].copy_from_slice(&whole[start as usize..start as usize + avail]);
+            return Ok(out);
+        }
+
+        let got = match self.data.get(&key, Some(start..end)) {
+            Ok(v) => v,
+            Err(e) => {
+                if self.data.stat(&key)?.is_none() {
+                    return Ok(vec![0u8; want as usize]);
+                }
+                return Err(e)
+                    .with_context(|| format!("fetch chunk {id} range {start}..{end}"));
+            }
+        };
+        let mut out = vec![0u8; want as usize];
+        let avail = got.len().min(n);
+        out[..avail].copy_from_slice(&got[..avail]);
+        Ok(out)
+    }
+}
+
+/// One fetch the object store has to perform for a planned read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRequest {
+    pub chunk: u64,
+    /// Byte offset inside the chunk.
+    pub start: u64,
+    /// Bytes to fetch from `start`.
+    pub len: u64,
+    /// Fetch the whole chunk (and cache it) rather than a range.
+    pub whole: bool,
+}
+
+/// Fetches a read needs before it can be served, plus any range bytes the
+/// plan can serve directly.
+#[derive(Debug, Clone, Default)]
+pub struct ReadPlan {
+    pub requests: Vec<FetchRequest>,
+}
+
+impl ReadPlan {
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+}
+
 /// Object key layout.
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -106,17 +218,51 @@ impl Layout {
         Layout { root: root.into() }
     }
 
-    pub fn chunk_key(&self, id: u64) -> String {
+    /// Object key for one version of a chunk.
+    ///
+    /// The uid is unique per written object, and an object is never modified
+    /// after it is written, so a new version can be uploaded while the old one
+    /// is still being served.
+    pub fn chunk_key(&self, uid: u32) -> String {
+        format!("{}/c/{}", self.root, uid)
+    }
+
+    /// The pre-uid layout, where the chunk index doubled as the object name.
+    pub fn legacy_chunk_key(&self, id: u64) -> String {
         format!("{}/c/{}", self.root, id)
     }
 }
 
 /// A chunk with local modifications.
 struct Working {
-    /// Full chunk contents; a whole-chunk upload needs them all.
+    /// Chunk contents. Blocks absent from `known` were never read from the
+    /// object store, so a whole-object upload must fill them in first.
     data: Vec<u8>,
+    /// Block indices whose `data` is valid.
+    known: std::collections::BTreeSet<u64>,
     dirty: BTreeMap<u64, ()>,
     since: Instant,
+}
+
+impl Working {
+    fn full(data: Vec<u8>) -> Working {
+        let blocks = data.len().div_ceil(BLOCK as usize) as u64;
+        Working {
+            data,
+            known: (0..blocks).collect(),
+            dirty: BTreeMap::new(),
+            since: Instant::now(),
+        }
+    }
+
+    fn partial(len: u64) -> Working {
+        Working {
+            data: vec![0u8; len as usize],
+            known: std::collections::BTreeSet::new(),
+            dirty: BTreeMap::new(),
+            since: Instant::now(),
+        }
+    }
 }
 
 /// Small LRU of clean chunks.
@@ -193,6 +339,14 @@ pub struct Volume {
     sent_bytes: u64,
     /// Reads served by a byte-range fetch instead of a whole chunk.
     partial_reads: u64,
+    /// Object uid currently holding each chunk that exists in the store.
+    uids: HashMap<u64, u32>,
+    /// Next uid to hand out.
+    next_uid: u32,
+    /// Objects superseded by a committed upload, awaiting deletion.
+    garbage: Vec<String>,
+    /// Objects deleted because a newer version replaced them.
+    reclaimed: u64,
 }
 
 impl Volume {
@@ -284,6 +438,10 @@ impl Volume {
             sent_chunks: 0,
             sent_bytes: 0,
             partial_reads: 0,
+            uids: HashMap::new(),
+            next_uid: 1,
+            garbage: Vec::new(),
+            reclaimed: 0,
         };
         vol.restore(snapshot)?;
         Ok(vol)
@@ -294,6 +452,13 @@ impl Volume {
     fn restore(&mut self, snap: Snapshot) -> Result<()> {
         let nchunks = snap.chunks.values().filter(|s| !s.dirty.is_empty()).count();
         let nblocks: usize = snap.chunks.values().map(|s| s.dirty.len()).sum();
+        // Every chunk present in the store has a committed object uid.
+        for (id, st) in &snap.chunks {
+            if st.uploaded {
+                self.uids.insert(*id, st.uid);
+                self.next_uid = self.next_uid.max(st.uid.saturating_add(1));
+            }
+        }
         if nchunks > 0 {
             log::info!(
                 "restoring {nchunks} modified chunk(s), {nblocks} block(s) pending upload"
@@ -303,15 +468,16 @@ impl Volume {
                     continue;
                 }
                 let len = self.geometry.chunk_len(id);
-                let data = self.fetch_chunk(id, len)?;
-                self.working.insert(
-                    id,
-                    Working {
-                        data,
-                        dirty: st.dirty,
-                        since: Instant::now(),
-                    },
-                );
+                let data = self.fetcher().fetch(&FetchRequest {
+                    chunk: id,
+                    start: 0,
+                    len,
+                    whole: true,
+                })?;
+                let mut w = Working::full(data);
+                w.dirty = st.dirty;
+                w.since = Instant::now();
+                self.working.insert(id, w);
             }
         }
         log::info!(
@@ -341,90 +507,22 @@ impl Volume {
         offset / self.geometry.chunk_size
     }
 
-    /// Fetch a whole chunk from the object store; a missing object is a hole.
-    fn fetch_chunk(&self, id: u64, len: u64) -> Result<Vec<u8>> {
-        let key = self.layout.chunk_key(id);
-        let mut v = match self.data.get(&key, None) {
-            Ok(v) => v,
-            Err(e) => {
-                if self.data.stat(&key)?.is_none() {
-                    vec![0u8; len as usize]
-                } else {
-                    return Err(e).with_context(|| format!("fetch chunk {id}"));
-                }
-            }
-        };
-        v.resize(len as usize, 0);
-        v.truncate(len as usize);
-        Ok(v)
-    }
-
-    /// Fetch only `[start, start+want)` of a chunk; a missing object or a
-    /// range past its end is a hole (zeros).
-    ///
-    /// Backends without `range_read` are asked for the whole object and the
-    /// slice is cut locally.
-    fn fetch_range(&self, id: u64, start: u64, want: u64) -> Result<Vec<u8>> {
-        let key = self.layout.chunk_key(id);
-        let chunk_len = self.geometry.chunk_len(id);
-        if start >= chunk_len {
-            return Ok(vec![0u8; want as usize]);
+    /// A fetcher that runs without holding the volume lock.
+    pub fn fetcher(&self) -> Fetcher {
+        Fetcher {
+            data: self.data.clone(),
+            layout: self.layout.clone(),
+            geometry: self.geometry.clone(),
+            caps: self.caps,
+            uids: self.uids.clone(),
         }
-        let end = (start + want).min(chunk_len);
-        let n = (end - start) as usize;
-
-        if !self.caps.range_read {
-            let mut whole = match self.data.get(&key, None) {
-                Ok(v) => v,
-                Err(e) => {
-                    if self.data.stat(&key)?.is_none() {
-                        return Ok(vec![0u8; want as usize]);
-                    }
-                    return Err(e).with_context(|| format!("fetch chunk {id}"));
-                }
-            };
-            whole.resize(chunk_len as usize, 0);
-            let mut out = vec![0u8; want as usize];
-            let avail = (whole.len() as u64).saturating_sub(start).min(n as u64) as usize;
-            out[..avail].copy_from_slice(&whole[start as usize..start as usize + avail]);
-            return Ok(out);
-        }
-
-        let got = match self.data.get(&key, Some(start..end)) {
-            Ok(v) => v,
-            Err(e) => {
-                if self.data.stat(&key)?.is_none() {
-                    return Ok(vec![0u8; want as usize]);
-                }
-                return Err(e).with_context(|| format!("fetch chunk {id} range {start}..{end}"));
-            }
-        };
-        let mut out = vec![0u8; want as usize];
-        let avail = got.len().min(n);
-        out[..avail].copy_from_slice(&got[..avail]);
-        Ok(out)
-    }
-
-    /// Current contents of a chunk: working copy, clean cache, or the store.
-    fn load_chunk(&mut self, id: u64) -> Result<Vec<u8>> {
-        if let Some(w) = self.working.get(&id) {
-            return Ok(w.data.clone());
-        }
-        if let Some(d) = self.read_cache.get(id) {
-            return Ok(d.clone());
-        }
-        let len = self.geometry.chunk_len(id);
-        let data = self.fetch_chunk(id, len)?;
-        self.read_cache.insert(id, data.clone());
-        Ok(data)
     }
 
     /// Read `blocks` blocks starting at block offset `blk`.
     ///
-    /// A read large enough to cover a good part of a chunk fetches and caches
-    /// the whole chunk, which is what a sequential reader wants. A small read
-    /// fetches only its own bytes: on S3, pulling 8 MiB to serve 4 KiB is a
-    /// 2048x amplification that also evicts useful cache entries.
+    /// Anything missing is fetched synchronously through a [`Fetcher`]. The
+    /// ublk path prefers [`Volume::plan_read`] + [`Volume::apply_fetch`] so the
+    /// network happens outside the volume lock.
     pub fn read(&mut self, blk: u64, blocks: usize, out: &mut [u8]) -> Result<()> {
         let want = blocks as u64 * BLOCK;
         if out.len() as u64 != want {
@@ -434,65 +532,132 @@ impl Volume {
         if end > self.geometry.size {
             anyhow::bail!("read past end of volume");
         }
+
+        let plan = self.plan_read(blk, blocks)?;
+        let mut ranges: Vec<(FetchRequest, Vec<u8>)> = Vec::new();
+        if !plan.is_empty() {
+            let fetcher = self.fetcher();
+            for req in &plan.requests {
+                let data = fetcher.fetch(req)?;
+                if req.whole {
+                    self.apply_fetch(req, data);
+                } else {
+                    // A range covers part of a chunk; keep it aside and copy it
+                    // straight out rather than caching it as a whole chunk.
+                    self.partial_reads += 1;
+                    ranges.push((req.clone(), data));
+                }
+            }
+        }
+        self.copy_out(blk, blocks, out, &ranges)
+    }
+
+    /// Copy blocks into `out` from the local copies, which must be complete.
+    fn copy_out(
+        &mut self,
+        blk: u64,
+        blocks: usize,
+        out: &mut [u8],
+        ranges: &[(FetchRequest, Vec<u8>)],
+    ) -> Result<()> {
+        let end = blk * BLOCK + blocks as u64 * BLOCK;
         let mut off = blk * BLOCK;
         let mut done = 0usize;
+        while off < end {
+            let id = self.chunk_of(off);
+            let local = (off - id * self.geometry.chunk_size) as usize;
+            let n = ((self.geometry.chunk_len(id) - local as u64).min(end - off)) as usize;
+
+            // A freshly fetched range wins over anything cached.
+            let covering = ranges.iter().find(|(r, _)| {
+                r.chunk == id
+                    && r.start <= local as u64
+                    && r.start + r.len >= (local + n) as u64
+            });
+            if let Some((r, data)) = covering {
+                let start = local - r.start as usize;
+                out[done..done + n].copy_from_slice(&data[start..start + n]);
+                done += n;
+                off += n as u64;
+                continue;
+            }
+
+            let src: &[u8] = if let Some(w) = self.working.get(&id) {
+                &w.data
+            } else if let Some(d) = self.read_cache.get(id) {
+                d
+            } else {
+                anyhow::bail!("chunk {id} missing from cache after planning a read");
+            };
+            if src.len() < local + n {
+                anyhow::bail!("chunk {id} shorter than expected");
+            }
+            out[done..done + n].copy_from_slice(&src[local..local + n]);
+            done += n;
+            off += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Decide what a read needs from the object store. Takes only local state,
+    /// so the caller can drop the lock before fetching.
+    pub fn plan_read(&mut self, blk: u64, blocks: usize) -> Result<ReadPlan> {
+        let want = blocks as u64 * BLOCK;
+        let end = blk * BLOCK + want;
+        if end > self.geometry.size {
+            anyhow::bail!("read past end of volume");
+        }
+        let mut plan = ReadPlan::default();
+        let mut off = blk * BLOCK;
         while off < end {
             let id = self.chunk_of(off);
             let local = off - id * self.geometry.chunk_size;
             let n = ((self.geometry.chunk_len(id) - local).min(end - off)) as usize;
 
-            // Working copies and cached chunks are already in memory.
-            if let Some(w) = self.working.get(&id) {
-                if w.data.len() < local as usize + n {
-                    anyhow::bail!("chunk {id} shorter than expected");
-                }
-                out[done..done + n].copy_from_slice(&w.data[local as usize..local as usize + n]);
-                done += n;
+            if self.working.contains_key(&id) || self.read_cache.get(id).is_some() {
                 off += n as u64;
                 continue;
             }
-            if let Some(d) = self.read_cache.get(id) {
-                if d.len() < local as usize + n {
-                    anyhow::bail!("chunk {id} shorter than expected");
-                }
-                out[done..done + n].copy_from_slice(&d[local as usize..local as usize + n]);
-                done += n;
-                off += n as u64;
-                continue;
-            }
-
             let chunk_len = self.geometry.chunk_len(id);
-
-            // A clean chunk may already be on disk from an earlier run.
             if let Some(mut c) = self.disk_cache.as_mut().and_then(|dc| dc.get(id, chunk_len)) {
                 if c.len() as u64 != chunk_len {
                     c.resize(chunk_len as usize, 0);
                 }
-                out[done..done + n].copy_from_slice(&c[local as usize..local as usize + n]);
                 self.read_cache.insert(id, c);
-                done += n;
                 off += n as u64;
                 continue;
             }
-
-            if self.should_cache_whole(chunk_len, n as u64) {
-                let c = self.fetch_chunk(id, chunk_len)?;
-                self.read_cache.insert(id, c.clone());
-                if let Some(dc) = self.disk_cache.as_mut() {
-                    if let Err(e) = dc.put(id, &c) {
-                        log::debug!("read cache store of chunk {id} failed: {e:#}");
-                    }
-                }
-                out[done..done + n].copy_from_slice(&c[local as usize..local as usize + n]);
-            } else {
-                let piece = self.fetch_range(id, local, n as u64)?;
-                out[done..done + n].copy_from_slice(&piece[..n]);
-                self.partial_reads += 1;
+            if !plan.requests.iter().any(|r: &FetchRequest| r.chunk == id) {
+                let whole = self.should_cache_whole(chunk_len, n as u64);
+                plan.requests.push(FetchRequest {
+                    chunk: id,
+                    start: if whole { 0 } else { local },
+                    len: if whole { chunk_len } else { n as u64 },
+                    whole,
+                });
             }
-            done += n;
             off += n as u64;
         }
-        Ok(())
+        Ok(plan)
+    }
+
+    /// Install a completed fetch.
+    ///
+    /// A whole-chunk fetch populates the chunk cache. A range fetch does not:
+    /// it covers only part of the chunk, so caching it would serve zeros for
+    /// the rest. Use [`Volume::read`] (or the ublk path) for range reads,
+    /// which copies them straight into the caller's buffer.
+    pub fn apply_fetch(&mut self, req: &FetchRequest, data: Vec<u8>) {
+        if !req.whole {
+            self.partial_reads += 1;
+            return;
+        }
+        if let Some(dc) = self.disk_cache.as_mut() {
+            if let Err(e) = dc.put(req.chunk, &data) {
+                log::debug!("read cache store of chunk {} failed: {e:#}", req.chunk);
+            }
+        }
+        self.read_cache.insert(req.chunk, data);
     }
 
     /// Whether a read of `want` bytes inside a `chunk_len` chunk is big enough
@@ -532,15 +697,11 @@ impl Volume {
 
     fn write_into_chunk(&mut self, id: u64, local: u64, data: &[u8]) -> Result<()> {
         if !self.working.contains_key(&id) {
-            let contents = self.load_chunk(id)?;
-            self.working.insert(
-                id,
-                Working {
-                    data: contents,
-                    dirty: BTreeMap::new(),
-                    since: Instant::now(),
-                },
-            );
+            // Start from a partial copy: a 4 KiB write must not pull 8 MiB.
+            // Untouched blocks are fetched only if a whole-object upload needs
+            // them, or when they are read.
+            let len = self.geometry.chunk_len(id);
+            self.working.insert(id, Working::partial(len));
             self.read_cache.remove(id);
             if let Some(dc) = self.disk_cache.as_mut() {
                 dc.remove(id);
@@ -562,19 +723,36 @@ impl Volume {
         let last = (local + data.len() as u64).div_ceil(BLOCK);
         for b in first..last {
             w.dirty.insert(b, ());
+            w.known.insert(b);
         }
         Ok(())
     }
 
-    /// Persist metadata describing the modified chunks.
+    /// Persist the metadata: the committed object uid of every chunk, plus the
+    /// dirty blocks of the chunks still in flight.
+    ///
+    /// Writing this file is the commit point of an upload: until it lands, the
+    /// previous object is still the one readers use.
     fn save_meta(&mut self) -> Result<()> {
         let mut chunks: BTreeMap<u64, ChunkState> = BTreeMap::new();
+        for (id, uid) in &self.uids {
+            chunks.insert(
+                *id,
+                ChunkState {
+                    dirty: BTreeMap::new(),
+                    uploaded: true,
+                    uid: *uid,
+                },
+            );
+        }
         for (id, w) in &self.working {
+            let committed = self.uids.get(id).copied();
             chunks.insert(
                 *id,
                 ChunkState {
                     dirty: w.dirty.clone(),
-                    uploaded: false,
+                    uploaded: committed.is_some(),
+                    uid: committed.unwrap_or(0),
                 },
             );
         }
@@ -586,48 +764,151 @@ impl Volume {
     }
 
     /// Upload one chunk. Returns the number of bytes sent.
+    ///
+    /// On a backend that can rewrite part of an object (WebDAV, local dir) the
+    /// dirty ranges are patched in place. Otherwise (S3) the chunk is written
+    /// as a brand new object under a fresh uid, the metadata is pointed at it,
+    /// and only then is the superseded object deleted. That ordering is what
+    /// makes an interrupted upload harmless: the old object stays untouched
+    /// until the new one is committed.
     fn upload(&mut self, id: u64) -> Result<u64> {
-        let Some(w) = self.working.get(&id) else {
+        if !self.working.contains_key(&id) {
             return Ok(0);
-        };
-        let key = self.layout.chunk_key(id);
+        }
 
-        let sent = if self.caps.partial_write && !w.dirty.is_empty() {
+        if self.caps.partial_write {
+            let key = match self.uids.get(&id) {
+                Some(uid) => self.layout.chunk_key(*uid),
+                None => self.layout.legacy_chunk_key(id),
+            };
             let mut sent = 0u64;
-            if self.data.stat(&key)?.is_none() {
-                // Nothing to patch yet: create the object in one go.
-                self.data.put(&key, &w.data)?;
-                sent += w.data.len() as u64;
-            } else {
-                for (start, end) in contiguous_ranges(&w.dirty) {
-                    let slice = &w.data[start..end];
-                    if let Err(e) = self.data.patch(&key, start as u64, slice) {
-                        // Never leave the object half-updated.
-                        log::warn!("patch {key} failed ({e}); uploading the whole chunk");
-                        self.data.put(&key, &w.data)?;
-                        sent += w.data.len() as u64;
-                        break;
+            {
+                let w = self.working.get(&id).unwrap();
+                let nearly_all = w.dirty.len() as u64 * BLOCK * 100
+                    >= (w.data.len() as u64).max(1) * 90;
+                if self.data.stat(&key)?.is_none() || nearly_all {
+                    self.data.put(&key, &w.data)?;
+                    sent += w.data.len() as u64;
+                } else {
+                    for (start, end) in contiguous_ranges(&w.dirty) {
+                        let slice = &w.data[start..end];
+                        if let Err(e) = self.data.patch(&key, start as u64, slice) {
+                            log::warn!("patch {key} failed ({e}); writing the whole object");
+                            self.data.put(&key, &w.data)?;
+                            sent += w.data.len() as u64;
+                            break;
+                        }
+                        sent += slice.len() as u64;
                     }
-                    sent += slice.len() as u64;
                 }
             }
-            sent
-        } else {
-            self.data.put(&key, &w.data)?;
+            let w = self.working.remove(&id).unwrap();
+            self.cache_uploaded(id, w.data);
+            self.save_meta()?;
+            self.sent_chunks += 1;
+            self.sent_bytes += sent;
+            return Ok(sent);
+        }
+
+        // S3-style: new object, commit the pointer, then delete the old one.
+        self.complete_working_copy(id)?;
+        let uid = self.next_uid;
+        self.next_uid = self.next_uid.wrapping_add(1).max(1);
+        let new_key = self.layout.chunk_key(uid);
+        let sent = {
+            let w = self.working.get(&id).unwrap();
+            self.data.put(&new_key, &w.data)?;
             w.data.len() as u64
         };
 
+        let previous = self.uids.insert(id, uid);
+        self.save_meta()?;
+
         let w = self.working.remove(&id).unwrap();
+        self.cache_uploaded(id, w.data);
+        if let Some(old) = previous {
+            self.garbage.push(if old == 0 {
+                self.layout.legacy_chunk_key(id)
+            } else {
+                self.layout.chunk_key(old)
+            });
+        }
+        self.sent_chunks += 1;
+        self.sent_bytes += sent;
+        self.collect_garbage();
+        Ok(sent)
+    }
+
+    /// Fill in blocks of a partial working copy that have never been read, so a
+    /// whole-object upload does not write zeros over them.
+    fn complete_working_copy(&mut self, id: u64) -> Result<()> {
+        let Some(w) = self.working.get(&id) else {
+            return Ok(());
+        };
+        let blocks = w.data.len().div_ceil(BLOCK as usize) as u64;
+        let missing: Vec<u64> = (0..blocks).filter(|b| !w.known.contains(b)).collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let len = w.data.len() as u64;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for b in missing {
+            let start = b * BLOCK;
+            let n = (len - start).min(BLOCK);
+            match ranges.last_mut() {
+                Some((s, l)) if *s + *l == start => *l += n,
+                _ => ranges.push((start, n)),
+            }
+        }
+        let fetcher = self.fetcher();
+        let mut fetched = Vec::with_capacity(ranges.len());
+        for (start, n) in ranges {
+            let req = FetchRequest {
+                chunk: id,
+                start,
+                len: n,
+                whole: false,
+            };
+            fetched.push((start, fetcher.fetch(&req)?));
+        }
+        let w = self.working.get_mut(&id).unwrap();
+        for (start, bytes) in fetched {
+            let off = start as usize;
+            let n = bytes.len().min(w.data.len() - off);
+            w.data[off..off + n].copy_from_slice(&bytes[..n]);
+            let first = start / BLOCK;
+            let last = (start + n as u64).div_ceil(BLOCK);
+            for b in first..last {
+                w.known.insert(b);
+            }
+        }
+        Ok(())
+    }
+
+    /// Move an uploaded working copy into the read caches.
+    fn cache_uploaded(&mut self, id: u64, data: Vec<u8>) {
         if let Some(dc) = self.disk_cache.as_mut() {
-            // The uploaded bytes are authoritative; keep them cached.
-            if let Err(e) = dc.put(id, &w.data) {
+            if let Err(e) = dc.put(id, &data) {
                 log::debug!("read cache store of chunk {id} failed: {e:#}");
             }
         }
-        self.read_cache.insert(id, w.data);
-        self.sent_chunks += 1;
-        self.sent_bytes += sent;
-        Ok(sent)
+        self.read_cache.insert(id, data);
+    }
+
+    /// Delete objects superseded by a committed upload.
+    ///
+    /// A failure is not fatal: the object is unreachable but wastes space.
+    fn collect_garbage(&mut self) {
+        if self.garbage.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.garbage);
+        for key in pending {
+            match self.data.delete(&key) {
+                Ok(()) => self.reclaimed += 1,
+                Err(e) => log::warn!("could not delete superseded object {key}: {e:#}"),
+            }
+        }
     }
 
     /// Upload everything; this is what a FLUSH request maps to.
@@ -636,7 +917,9 @@ impl Volume {
         for id in ids {
             self.upload(id)?;
         }
-        self.save_meta()
+        self.save_meta()?;
+        self.collect_garbage();
+        Ok(())
     }
 
     /// Upload chunks that are full enough or have been dirty long enough.
@@ -658,7 +941,9 @@ impl Volume {
         for id in ready {
             self.upload(id)?;
         }
-        self.save_meta()
+        self.save_meta()?;
+        self.collect_garbage();
+        Ok(())
     }
 
     pub fn dirty_chunks(&self) -> usize {

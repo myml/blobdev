@@ -265,19 +265,13 @@ pub fn process_op(
     let lock = || volume.lock().unwrap_or_else(|p| p.into_inner());
 
     match op {
-        libublk::sys::UBLK_IO_OP_READ => {
-            if byte_off % BLOCK != 0 || bytes as u64 % BLOCK != 0 {
-                return unaligned_read(&mut lock(), byte_off, bytes, buf);
+        libublk::sys::UBLK_IO_OP_READ => match read_staged(volume, byte_off, bytes, buf) {
+            Ok(()) => bytes as i32,
+            Err(e) => {
+                log::error!("read at {byte_off}: {e:#}");
+                -libc::EIO
             }
-            let blk = byte_off / BLOCK;
-            match lock().read(blk, bytes / BLOCK as usize, buf) {
-                Ok(()) => bytes as i32,
-                Err(e) => {
-                    log::error!("read at {byte_off}: {e:#}");
-                    -libc::EIO
-                }
-            }
-        }
+        },
         libublk::sys::UBLK_IO_OP_WRITE => {
             let res = if byte_off % BLOCK != 0 || bytes as u64 % BLOCK != 0 {
                 unaligned_write(&mut lock(), byte_off, bytes, buf)
@@ -320,20 +314,64 @@ pub fn process_op(
     }
 }
 
-/// Sub-block read: fetch the covering blocks and copy the requested slice.
-fn unaligned_read(volume: &mut Volume, byte_off: u64, bytes: usize, buf: &mut [u8]) -> i32 {
-    let first = byte_off / BLOCK;
-    let last = (byte_off + bytes as u64).div_ceil(BLOCK);
-    let mut tmp = vec![0u8; ((last - first) * BLOCK) as usize];
-    if let Err(e) = volume.read(first, (last - first) as usize, &mut tmp) {
-        log::error!("unaligned read at {byte_off}: {e:#}");
-        return -libc::EIO;
+/// Serve a read in three phases so the network is never touched under the lock:
+/// plan (locked), fetch (unlocked), install + copy (locked).
+///
+/// Without this, one slow object-store request would block every queue thread
+/// and the background uploader, because they all share one volume lock.
+fn read_staged(volume: &Mutex<Volume>, byte_off: u64, bytes: usize, buf: &mut [u8]) -> Result<()> {
+    let (aligned_off, blocks, want) = if byte_off % BLOCK == 0 && bytes as u64 % BLOCK == 0 {
+        (byte_off, Some(bytes / BLOCK as usize), bytes)
+    } else {
+        // Covering blocks for a sub-block request.
+        let first = byte_off / BLOCK;
+        let last = (byte_off + bytes as u64).div_ceil(BLOCK);
+        (
+            first * BLOCK,
+            Some((last - first) as usize),
+            ((last - first) * BLOCK) as usize,
+        )
+    };
+    let Some(blocks) = blocks else {
+        anyhow::bail!("empty read");
+    };
+
+    // Phase 1 (locked): decide what is missing.
+    let (plan, fetcher) = {
+        let mut v = volume.lock().unwrap_or_else(|p| p.into_inner());
+        (v.plan_read(aligned_off / BLOCK, blocks)?, v.fetcher())
+    };
+
+    // Phase 2 (UNLOCKED): talk to the object store. Other queue threads and
+    // the uploader keep working while this request is in flight.
+    let mut fetched = Vec::with_capacity(plan.requests.len());
+    for req in &plan.requests {
+        let data = fetcher.fetch(req)?;
+        fetched.push((req.clone(), data));
     }
-    let off = (byte_off % BLOCK) as usize;
-    buf[..bytes].copy_from_slice(&tmp[off..off + bytes]);
-    bytes as i32
+    drop(fetcher);
+    {
+        let mut v = volume.lock().unwrap_or_else(|p| p.into_inner());
+        for (req, data) in fetched {
+            v.apply_fetch(&req, data);
+        }
+    }
+
+    let mut whole = vec![0u8; want];
+    {
+        let mut v = volume.lock().unwrap_or_else(|p| p.into_inner());
+        v.read(aligned_off / BLOCK, blocks, &mut whole)?;
+    }
+    if aligned_off == byte_off && want == bytes {
+        buf.copy_from_slice(&whole);
+    } else {
+        let off = (byte_off - aligned_off) as usize;
+        buf[..bytes].copy_from_slice(&whole[off..off + bytes]);
+    }
+    Ok(())
 }
 
+/// Sub-block read: fetch the covering blocks and copy the requested slice.
 /// Sub-block write: read-modify-write the covering blocks.
 fn unaligned_write(volume: &mut Volume, byte_off: u64, bytes: usize, buf: &[u8]) -> i32 {
     let first = byte_off / BLOCK;

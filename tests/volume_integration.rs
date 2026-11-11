@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use blobdev::meta::{FileMeta, Geometry};
+use blobdev::store::{Caps, ObjectStore};
 use blobdev::store::DirStore;
 use blobdev::volume::{Create, Layout, Policy, Volume, BLOCK, DEFAULT_CHUNK};
 
@@ -174,5 +175,320 @@ fn opening_without_metadata_and_size_fails_clearly() {
         err.contains("no metadata"),
         "unhelpful error when the volume does not exist: {err}"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Regression: writing one block into an existing chunk must not upload
+/// zeros over the blocks it never read.
+///
+/// A write starts from a partial working copy (no fetch), so a whole-chunk
+/// upload on S3 has to fill the untouched blocks first. If that step were
+/// skipped, every 4 KiB write would blank the other 2047 blocks of the chunk.
+#[test]
+fn writing_one_block_does_not_clobber_the_rest_of_the_chunk() {
+    let root = tmpdir("clobber");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = DEFAULT_CHUNK;
+
+    // Establish a chunk with two distinct regions.
+    {
+        let store = Arc::new(DirStore::new(&objects).unwrap());
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(size)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, 4, &blocks(4, 0xA1)).unwrap();
+        v.write(100, 4, &blocks(4, 0xB2)).unwrap();
+        v.flush().unwrap();
+    }
+
+    // Fresh process: write a single unrelated block, then flush.
+    {
+        let store = Arc::new(DirStore::new(&objects).unwrap());
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            None,
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(500, 1, &blocks(1, 0xC3)).unwrap();
+        v.flush().unwrap();
+    }
+
+    // Everything written earlier must still be there.
+    let store = Arc::new(DirStore::new(&objects).unwrap());
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    for b in 0..4u64 {
+        let mut buf = vec![0u8; BLOCK as usize];
+        v.read(b, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xA1, "block {b} was clobbered by a later write");
+    }
+    for b in 100..104u64 {
+        let mut buf = vec![0u8; BLOCK as usize];
+        v.read(b, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xB2, "block {b} was clobbered by a later write");
+    }
+    let mut buf = vec![0u8; BLOCK as usize];
+    v.read(500, 1, &mut buf).unwrap();
+    assert_eq!(buf[0], 0xC3);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The dangerous case: a backend without partial writes (S3) rewrites the
+/// whole chunk on upload, so an incomplete working copy would destroy data.
+#[test]
+fn whole_chunk_upload_on_s3_like_backend_preserves_untouched_blocks() {
+    use blobdev::store::{Caps, ObjectStore};
+
+    /// DirStore with partial writes disabled, i.e. S3 semantics.
+    struct S3Like(DirStore);
+    impl ObjectStore for S3Like {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.0.stat(key)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<std::ops::Range<u64>>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.0.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.0.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key)
+        }
+    }
+
+    let root = tmpdir("s3like");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = DEFAULT_CHUNK;
+
+    {
+        let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+        assert!(!store.caps().partial_write);
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(size)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, 4, &blocks(4, 0x11)).unwrap();
+        v.write(100, 4, &blocks(4, 0x22)).unwrap();
+        v.flush().unwrap();
+    }
+
+    // Write one block in a new process; the upload rewrites the whole chunk.
+    {
+        let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            None,
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(500, 1, &blocks(1, 0x33)).unwrap();
+        v.flush().unwrap();
+    }
+
+    let store = Arc::new(S3Like(DirStore::new(&objects).unwrap()));
+    let mut v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    for (range, want) in [(0..4u64, 0x11u8), (100..104, 0x22)] {
+        for b in range {
+            let mut buf = vec![0u8; BLOCK as usize];
+            v.read(b, 1, &mut buf).unwrap();
+            assert_eq!(
+                buf[0], want,
+                "block {b} lost its data in a whole-chunk upload"
+            );
+        }
+    }
+    let mut buf = vec![0u8; BLOCK as usize];
+    v.read(500, 1, &mut buf).unwrap();
+    assert_eq!(buf[0], 0x33);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The point of copy-on-write: an upload that fails part way must leave the
+/// volume readable at its previous content, not half-written.
+#[test]
+fn failed_upload_keeps_the_previous_version_readable() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    /// S3-like store whose PUTs start failing after `fail_after` successes.
+    struct FlakyStore {
+        inner: DirStore,
+        puts: AtomicU64,
+        fail_after: AtomicU64,
+        fail: Mutex<bool>,
+    }
+    impl ObjectStore for FlakyStore {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.stat(key)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<std::ops::Range<u64>>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            if *self.fail.lock().unwrap() && self.puts.load(Ordering::SeqCst) >= self.fail_after.load(Ordering::SeqCst) {
+                anyhow::bail!("simulated S3 outage");
+            }
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+    let root = tmpdir("cowfail");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = DEFAULT_CHUNK;
+
+    let store = Arc::new(FlakyStore {
+        inner: DirStore::new(&objects).unwrap(),
+        puts: AtomicU64::new(0),
+        fail_after: AtomicU64::new(u64::MAX),
+        fail: Mutex::new(false),
+    });
+
+    // Version 1 committed.
+    {
+        let mut v = Volume::open(
+            store.clone() as Arc<dyn ObjectStore>,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(size)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, 2, &blocks(2, 0x01)).unwrap();
+        v.flush().unwrap();
+    }
+
+    // Version 2 begins uploading and the store dies.
+    {
+        let mut v = Volume::open(
+            store.clone() as Arc<dyn ObjectStore>,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            None,
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, 2, &blocks(2, 0x02)).unwrap();
+        *store.fail.lock().unwrap() = true;
+        store.fail_after.store(0, Ordering::SeqCst);
+        let err = v.flush();
+        assert!(err.is_err(), "the flush should have reported the outage");
+    }
+
+    // The store recovers; the volume must still read version 1.
+    *store.fail.lock().unwrap() = false;
+    store.fail_after.store(u64::MAX, Ordering::SeqCst);
+    let mut v = Volume::open(
+        store.clone() as Arc<dyn ObjectStore>,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    for b in 0..2u64 {
+        let mut buf = vec![0u8; BLOCK as usize];
+        v.read(b, 1, &mut buf).unwrap();
+        assert_eq!(
+            buf[0], 0x01,
+            "block {b} should still hold the last committed version"
+        );
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A successful copy-on-write upload must reclaim the superseded object.
+#[test]
+fn superseded_objects_are_deleted() {
+    let root = tmpdir("cowgc");
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let size = DEFAULT_CHUNK;
+    let store = Arc::new(DirStore::new(&objects).unwrap());
+
+    let mut v = Volume::open(
+        store as Arc<dyn ObjectStore>,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        Some(Create::new(size)),
+        Policy::default(),
+    )
+    .unwrap();
+    // Three overwrites: each leaves one generation behind.
+    for round in 0..3u8 {
+        v.write(0, 1, &blocks(1, round + 1)).unwrap();
+        v.flush().unwrap();
+    }
+
+    let chunk_dir = objects.join("vol").join("c");
+    let files: Vec<String> = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "expected exactly one live chunk object, found {files:?}"
+    );
+    // The dir backend supports partial writes, so it patches the object in
+    // place and keeps the original key; only S3-style backends roll
+    // generations. Either way exactly one object survives.
+    assert!(
+        files[0] == "0" || files[0].starts_with("0."),
+        "unexpected key {}",
+        files[0]
+    );
+
+    // And the data is the newest version.
+    let mut buf = vec![0u8; BLOCK as usize];
+    v.read(0, 1, &mut buf).unwrap();
+    assert_eq!(buf[0], 3);
     std::fs::remove_dir_all(&root).ok();
 }

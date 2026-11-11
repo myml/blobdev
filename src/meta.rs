@@ -23,7 +23,9 @@ use std::path::Path;
 #[allow(dead_code)]
 pub const META_MAGIC: u64 = 0x424c_4f42_4d45_5430; // "BLOBMET0"
 #[allow(dead_code)]
-pub const META_VERSION: u32 = 1;
+/// v1: per-chunk `[id][ndirty][uploaded][dirty...]`
+/// v2: adds a 32-bit uid after `uploaded`
+pub const META_VERSION: u32 = 2;
 
 /// Geometry of a volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +75,12 @@ pub struct ChunkState {
     pub dirty: BTreeMap<u64, ()>,
     /// Set once the chunk object exists in the object store.
     pub uploaded: bool,
+    /// Which data object currently holds this chunk, as a per-volume object id.
+    ///
+    /// Chunk objects are written under `<uid>` and never modified, so an
+    /// upload is a three step operation: write the new object, point this
+    /// field at it (the commit point), then delete the old object.
+    pub uid: u32,
 }
 
 impl ChunkState {
@@ -107,6 +115,7 @@ impl Snapshot {
             b.extend_from_slice(&id.to_le_bytes());
             b.extend_from_slice(&(st.dirty.len() as u64).to_le_bytes());
             b.extend_from_slice(&[st.uploaded as u8]);
+            b.extend_from_slice(&st.uid.to_le_bytes());
             for blk in st.dirty.keys() {
                 b.extend_from_slice(&blk.to_le_bytes());
             }
@@ -129,7 +138,7 @@ impl Snapshot {
             anyhow::bail!("bad metadata magic");
         }
         let version = u32::from_le_bytes(body[8..12].try_into().unwrap());
-        if version != META_VERSION {
+        if version != 1 && version != META_VERSION {
             anyhow::bail!("unsupported metadata version {version}");
         }
         let chunk_size = u64::from_le_bytes(body[12..20].try_into().unwrap());
@@ -148,6 +157,18 @@ impl Snapshot {
             let ndirty = u64::from_le_bytes(body[off + 8..off + 16].try_into().unwrap());
             let uploaded = body[off + 16] != 0;
             off += 17;
+            // v1 had no uid; such a volume stored chunk <id> directly, which we
+            // treat as uid 0 so the legacy key still resolves.
+            let uid = if version >= 2 {
+                if off + 4 > body.len() {
+                    anyhow::bail!("metadata snapshot truncated in chunk {id}");
+                }
+                let g = u32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                g
+            } else {
+                0
+            };
             let mut dirty = BTreeMap::new();
             for _ in 0..ndirty {
                 if off + 8 > body.len() {
@@ -157,7 +178,14 @@ impl Snapshot {
                 off += 8;
                 dirty.insert(blk, ());
             }
-            chunks.insert(id, ChunkState { dirty, uploaded });
+            chunks.insert(
+                id,
+                ChunkState {
+                    dirty,
+                    uploaded,
+                    uid,
+                },
+            );
         }
         Ok(Snapshot { geometry, chunks })
     }

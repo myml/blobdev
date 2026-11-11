@@ -631,6 +631,7 @@ fn find_prop(body: &str, name: &str) -> Option<String> {
         None => {
             let bare = format!("<{name}>");
             let i = body.find(&bare)? + bare.len();
+            let _ = i;
             i
         }
     };
@@ -714,9 +715,10 @@ mod tests {
         );
         assert_eq!(object_path(&base, "", "v/c/12"), format!("{}/v/c/12", base.trim_end_matches('/')));
         // Encoding: space, plus, percent, non-ASCII, reserved query characters.
-        assert_eq!(object_path(&base, "a b", "c/d e+f%g"), format!(
+        assert_eq!(
+            object_path(&base, "a b", "c/d e+f%g"),
             "https://dav.example.com/remote.php/dav/files/me/a%20b/c/d%20e%2Bf%25g"
-        ));
+        );
         assert_eq!(encode_segment("ü"), "%C3%BC");
         assert_eq!(encode_segment("x?y#z"), "x%3Fy%23z");
         assert_eq!(encode_segment("a&b=c,d;e"), "a&b=c,d;e");

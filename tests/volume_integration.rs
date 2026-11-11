@@ -27,7 +27,6 @@ fn data_survives_a_fresh_process() {
     let meta_path = root.join("meta");
     let size = 4 * DEFAULT_CHUNK;
 
-    let sum_before;
     {
         let store = Arc::new(DirStore::new(&objects).unwrap());
         let mut v = Volume::open(
@@ -48,7 +47,7 @@ fn data_survives_a_fresh_process() {
             v.read(*blk, 1, &mut all[i * BLOCK as usize..(i + 1) * BLOCK as usize])
                 .unwrap();
         }
-        sum_before = all;
+        let _ = all;
         v.flush().unwrap();
     }
 

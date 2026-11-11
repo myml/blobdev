@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::volume::{Create, Volume, BLOCK};
+use crate::volume::{Volume, BLOCK};
 
 /// Shared state handed to every queue thread.
 pub struct Shared {
@@ -215,7 +215,7 @@ fn handle_command(
     }
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
-    let fua = iod.op_flags & libublk::sys::UBLK_IO_F_FUA as u32 != 0;
+    let fua = iod.op_flags & libublk::sys::UBLK_IO_F_FUA != 0;
     // FLUSH has no meaningful sector; avoid overflowing the multiplication.
     let sector = iod.start_sector.wrapping_mul(512);
     let bytes = (iod.nr_sectors as usize) * 512;

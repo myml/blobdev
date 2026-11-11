@@ -1065,7 +1065,9 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         .unwrap();
         let (uri, host) = s.target("c/0").unwrap();
         let url = format!("{}://{}{}", s.ep.scheme, s.authority(), uri);
-        let parsed: ureq::http::Uri = url.parse().expect(&format!("{url} is a valid URI"));
+        let parsed: ureq::http::Uri = url
+            .parse()
+            .unwrap_or_else(|e| panic!("{url} is not a valid URI: {e}"));
         assert_eq!(parsed.scheme_str(), Some("http"));
         assert_eq!(parsed.authority().unwrap().host(), "192.168.0.220");
         assert_eq!(parsed.authority().unwrap().port_u16(), Some(9000));

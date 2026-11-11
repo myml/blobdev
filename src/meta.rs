@@ -264,8 +264,10 @@ mod tests {
         st.dirty.insert(1, ());
         st.dirty.insert(9, ());
         s.chunks.insert(3, st);
-        let mut up = ChunkState::default();
-        up.uploaded = true;
+        let up = ChunkState {
+            uploaded: true,
+            ..Default::default()
+        };
         s.chunks.insert(4, up);
         s
     }

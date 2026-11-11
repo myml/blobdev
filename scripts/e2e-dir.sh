@@ -23,7 +23,7 @@ rm -rf "$ROOT"; mkdir -p "$ROOT/objects" "$ROOT/cache"
 
 echo "== start the device"
 "$BIN" run --backend dir --dir "$ROOT/objects" --volume $VOL \
-  --create-size 512M --meta "$ROOT/cache/$VOL.meta" --id 0 \
+  --create-size 512M --meta "$ROOT/cache/$VOL.meta" --id -1 \
   > "$ROOT/log" 2>&1 &
 for i in $(seq 1 40); do
   DEV=$(grep -oE "/dev/ublkb[0-9]+" "$ROOT/log" | head -1)
@@ -58,7 +58,7 @@ cleanup
 
 echo "== restart from the object store and verify"
 "$BIN" run --backend dir --dir "$ROOT/objects" --volume $VOL \
-  --meta "$ROOT/cache/$VOL.meta" --id 0 > "$ROOT/log2" 2>&1 &
+  --meta "$ROOT/cache/$VOL.meta" --id -1 > "$ROOT/log2" 2>&1 &
 DEV=""
 for i in $(seq 1 40); do
   DEV=$(grep -oE "/dev/ublkb[0-9]+" "$ROOT/log2" | head -1)

@@ -106,13 +106,33 @@ umount /mnt          # 触发 flush，所有脏 chunk 上传
 ## 测试
 
 ```bash
-cargo test                      # 单元 + 集成测试，不需要网络和内核支持
-scripts/e2e-dir.sh              # 端到端：真块设备 + mkfs + 重启校验（需要 ublk 和 root）
+cargo test                      # 51 单元 + 4 集成测试，不需要网络和内核支持
+scripts/e2e-dir.sh              # 端到端（目录后端）
+scripts/e2e-s3.sh               # 端到端（S3，需先准备服务端）
+scripts/e2e-webdav.sh           # 端到端（WebDAV）
 scripts/webdav_server.py DIR    # 本地 WebDAV 测试服务端（纯标准库）
 ```
 
-端到端脚本验证：设备容量、mkfs/mount、写 120 MiB、缓存读回一致、
-flush 后对象存储出现 chunk 对象、**完全重启后从对象存储重读并比对 sha256**。
+端到端脚本都需要 root 和 ublk，会验证：设备容量、mkfs/mount、写入、
+缓存读回一致、flush 后对象存储出现 chunk 对象、
+**完全重启后从对象存储重读并比对 sha256**。
+
+### 实测结果
+
+在 Linux 7.0.14（`ublk_drv`）+ RustFS（S3，podman）上实际跑过：
+
+| 场景 | 结果 |
+|---|---|
+| 目录后端：写 120 MiB → flush → 重启重读 | 通过，22 个 chunk 对象，sha256 一致 |
+| WebDAV：写 40 MiB → flush → 重启重读 | 通过，sha256 一致 |
+| S3（RustFS）：写 80 MiB → flush → 重启重读 | 通过，sha256 一致，0 错误 |
+| S3：写 512 MiB（4 个文件）→ 重启重读 | 通过，写入耗时 2 秒（不等待上传） |
+| S3：写 30 MiB → `sync` → `kill -9` → 重启 | 通过，日志显示 `restoring N chunk(s)`，sha256 一致 |
+
+**崩溃恢复的语义**要分清：`sync` 之后数据已经到达 blobdev（在内核页缓存之外），
+此时 `kill -9` 不会丢数据，因为元数据记录了哪些块待上传。
+如果在 `sync` 之前就 `kill -9`，数据还在内核页缓存里，那属于文件系统层面的丢失，
+与被缓存的磁盘一样，不是 blobdev 能负责的范围。
 
 ## 已知限制
 

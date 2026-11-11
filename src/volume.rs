@@ -541,6 +541,18 @@ impl Volume {
         &self.geometry
     }
 
+    /// Key of the object that holds object index `id`.
+    ///
+    /// `uid` 0 marks an object that was patched in place and is stored under
+    /// its index; it is not a usable uid, because `chunk_key(0)` names object
+    /// 0 and every object would then read object 0's bytes.
+    fn object_key(&self, id: u64) -> String {
+        match self.uids.get(&id) {
+            Some(uid) if *uid != 0 => self.layout.chunk_key(*uid),
+            _ => self.layout.legacy_chunk_key(id),
+        }
+    }
+
     /// Physical object covering a volume offset.
     fn object_of(&self, offset: u64) -> u64 {
         self.geometry.locate(offset).0
@@ -855,10 +867,7 @@ impl Volume {
             // and a whole-object write must not publish zeros for blocks this
             // write never touched, so fill them in from the store first.
             let needs_full_put = {
-                let key = match self.uids.get(&id) {
-                    Some(uid) => self.layout.chunk_key(*uid),
-                    None => self.layout.legacy_chunk_key(id),
-                };
+                let key = self.object_key(id);
                 let w = self.working.get(&id).unwrap();
                 let nearly_all = w.dirty.len() as u64 * BLOCK * 100
                     >= (w.data.len() as u64).max(1) * 90;
@@ -870,10 +879,7 @@ impl Volume {
             if needs_full_put || self.needs_completion(id) {
                 self.complete_working_copy(id)?;
             }
-            let key = match self.uids.get(&id) {
-                Some(uid) => self.layout.chunk_key(*uid),
-                None => self.layout.legacy_chunk_key(id),
-            };
+            let key = self.object_key(id);
             let mut sent = 0u64;
             {
                 let w = self.working.get(&id).unwrap();

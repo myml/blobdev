@@ -2,6 +2,7 @@
 //! independently of the ublk device and the CLI.
 
 pub mod meta;
+pub mod readcache;
 pub mod s3;
 pub mod store;
 pub mod ublk_tgt;

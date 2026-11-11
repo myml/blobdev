@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::meta::{ChunkState, Geometry, MetaStore, Snapshot};
+use crate::readcache::ReadCache;
 use crate::store::{Caps, ObjectStore};
 
 pub const BLOCK: u64 = 4096;
@@ -37,6 +38,22 @@ pub const DEFAULT_CHUNK: u64 = 8 << 20;
 pub struct Create {
     pub size: u64,
     pub chunk_size: Option<u64>,
+}
+
+/// Optional on-disk read cache settings.
+#[derive(Debug, Clone)]
+pub struct DiskCache {
+    pub dir: std::path::PathBuf,
+    pub max_bytes: u64,
+}
+
+impl DiskCache {
+    pub fn new(dir: impl Into<std::path::PathBuf>, max_bytes: u64) -> DiskCache {
+        DiskCache {
+            dir: dir.into(),
+            max_bytes,
+        }
+    }
 }
 
 impl Create {
@@ -62,6 +79,9 @@ pub struct Policy {
     pub max_age: std::time::Duration,
     /// How many clean chunks to keep resident for reads.
     pub read_chunks: usize,
+    /// Fetch and cache a whole chunk when a read covers at least this
+    /// percentage of it (percent). Smaller reads use a byte-range fetch.
+    pub whole_chunk_pct: u64,
 }
 
 impl Default for Policy {
@@ -70,6 +90,7 @@ impl Default for Policy {
             full_pct: 50,
             max_age: std::time::Duration::from_secs(30),
             read_chunks: 64,
+            whole_chunk_pct: 25,
         }
     }
 }
@@ -166,8 +187,12 @@ pub struct Volume {
     geometry: Geometry,
     working: HashMap<u64, Working>,
     read_cache: LruChunks,
+    /// Optional on-disk cache of clean chunks.
+    disk_cache: Option<ReadCache>,
     sent_chunks: u64,
     sent_bytes: u64,
+    /// Reads served by a byte-range fetch instead of a whole chunk.
+    partial_reads: u64,
 }
 
 impl Volume {
@@ -177,10 +202,22 @@ impl Volume {
     /// when the volume does not exist yet.
     pub fn open(
         data: Arc<dyn ObjectStore>,
+        meta: Box<dyn MetaStore>,
+        layout: Layout,
+        create: Option<Create>,
+        policy: Policy,
+    ) -> Result<Volume> {
+        Volume::open_with_cache(data, meta, layout, create, policy, None)
+    }
+
+    /// Like [`Volume::open`], with an optional on-disk read cache.
+    pub fn open_with_cache(
+        data: Arc<dyn ObjectStore>,
         mut meta: Box<dyn MetaStore>,
         layout: Layout,
         create: Option<Create>,
         policy: Policy,
+        disk: Option<DiskCache>,
     ) -> Result<Volume> {
         let caps = data.caps();
         let snapshot = match meta.load()? {
@@ -213,6 +250,27 @@ impl Volume {
 
         let geometry = snapshot.geometry.clone();
         let read_cache = LruChunks::new(policy.read_chunks);
+        let disk_cache = match disk {
+            Some(d) if d.max_bytes > 0 => {
+                match ReadCache::open(&d.dir, &layout.root, d.max_bytes) {
+                    Ok(c) => {
+                        log::info!(
+                            "read cache {}: {} of {} MiB used, {} chunks",
+                            d.dir.display(),
+                            c.used_bytes() >> 20,
+                            d.max_bytes >> 20,
+                            c.entry_count()
+                        );
+                        Some(c)
+                    }
+                    Err(e) => {
+                        log::warn!("read cache disabled: {e:#}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         let mut vol = Volume {
             data,
             meta,
@@ -222,8 +280,10 @@ impl Volume {
             geometry,
             working: HashMap::new(),
             read_cache,
+            disk_cache,
             sent_chunks: 0,
             sent_bytes: 0,
+            partial_reads: 0,
         };
         vol.restore(snapshot)?;
         Ok(vol)
@@ -281,7 +341,7 @@ impl Volume {
         offset / self.geometry.chunk_size
     }
 
-    /// Fetch a chunk from the object store; a missing object is a hole.
+    /// Fetch a whole chunk from the object store; a missing object is a hole.
     fn fetch_chunk(&self, id: u64, len: u64) -> Result<Vec<u8>> {
         let key = self.layout.chunk_key(id);
         let mut v = match self.data.get(&key, None) {
@@ -299,6 +359,52 @@ impl Volume {
         Ok(v)
     }
 
+    /// Fetch only `[start, start+want)` of a chunk; a missing object or a
+    /// range past its end is a hole (zeros).
+    ///
+    /// Backends without `range_read` are asked for the whole object and the
+    /// slice is cut locally.
+    fn fetch_range(&self, id: u64, start: u64, want: u64) -> Result<Vec<u8>> {
+        let key = self.layout.chunk_key(id);
+        let chunk_len = self.geometry.chunk_len(id);
+        if start >= chunk_len {
+            return Ok(vec![0u8; want as usize]);
+        }
+        let end = (start + want).min(chunk_len);
+        let n = (end - start) as usize;
+
+        if !self.caps.range_read {
+            let mut whole = match self.data.get(&key, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    if self.data.stat(&key)?.is_none() {
+                        return Ok(vec![0u8; want as usize]);
+                    }
+                    return Err(e).with_context(|| format!("fetch chunk {id}"));
+                }
+            };
+            whole.resize(chunk_len as usize, 0);
+            let mut out = vec![0u8; want as usize];
+            let avail = (whole.len() as u64).saturating_sub(start).min(n as u64) as usize;
+            out[..avail].copy_from_slice(&whole[start as usize..start as usize + avail]);
+            return Ok(out);
+        }
+
+        let got = match self.data.get(&key, Some(start..end)) {
+            Ok(v) => v,
+            Err(e) => {
+                if self.data.stat(&key)?.is_none() {
+                    return Ok(vec![0u8; want as usize]);
+                }
+                return Err(e).with_context(|| format!("fetch chunk {id} range {start}..{end}"));
+            }
+        };
+        let mut out = vec![0u8; want as usize];
+        let avail = got.len().min(n);
+        out[..avail].copy_from_slice(&got[..avail]);
+        Ok(out)
+    }
+
     /// Current contents of a chunk: working copy, clean cache, or the store.
     fn load_chunk(&mut self, id: u64) -> Result<Vec<u8>> {
         if let Some(w) = self.working.get(&id) {
@@ -314,6 +420,11 @@ impl Volume {
     }
 
     /// Read `blocks` blocks starting at block offset `blk`.
+    ///
+    /// A read large enough to cover a good part of a chunk fetches and caches
+    /// the whole chunk, which is what a sequential reader wants. A small read
+    /// fetches only its own bytes: on S3, pulling 8 MiB to serve 4 KiB is a
+    /// 2048x amplification that also evicts useful cache entries.
     pub fn read(&mut self, blk: u64, blocks: usize, out: &mut [u8]) -> Result<()> {
         let want = blocks as u64 * BLOCK;
         if out.len() as u64 != want {
@@ -329,15 +440,70 @@ impl Volume {
             let id = self.chunk_of(off);
             let local = off - id * self.geometry.chunk_size;
             let n = ((self.geometry.chunk_len(id) - local).min(end - off)) as usize;
-            let c = self.load_chunk(id)?;
-            if c.len() < local as usize + n {
-                anyhow::bail!("chunk {id} shorter than expected");
+
+            // Working copies and cached chunks are already in memory.
+            if let Some(w) = self.working.get(&id) {
+                if w.data.len() < local as usize + n {
+                    anyhow::bail!("chunk {id} shorter than expected");
+                }
+                out[done..done + n].copy_from_slice(&w.data[local as usize..local as usize + n]);
+                done += n;
+                off += n as u64;
+                continue;
             }
-            out[done..done + n].copy_from_slice(&c[local as usize..local as usize + n]);
+            if let Some(d) = self.read_cache.get(id) {
+                if d.len() < local as usize + n {
+                    anyhow::bail!("chunk {id} shorter than expected");
+                }
+                out[done..done + n].copy_from_slice(&d[local as usize..local as usize + n]);
+                done += n;
+                off += n as u64;
+                continue;
+            }
+
+            let chunk_len = self.geometry.chunk_len(id);
+
+            // A clean chunk may already be on disk from an earlier run.
+            if let Some(mut c) = self.disk_cache.as_mut().and_then(|dc| dc.get(id, chunk_len)) {
+                if c.len() as u64 != chunk_len {
+                    c.resize(chunk_len as usize, 0);
+                }
+                out[done..done + n].copy_from_slice(&c[local as usize..local as usize + n]);
+                self.read_cache.insert(id, c);
+                done += n;
+                off += n as u64;
+                continue;
+            }
+
+            if self.should_cache_whole(chunk_len, n as u64) {
+                let c = self.fetch_chunk(id, chunk_len)?;
+                self.read_cache.insert(id, c.clone());
+                if let Some(dc) = self.disk_cache.as_mut() {
+                    if let Err(e) = dc.put(id, &c) {
+                        log::debug!("read cache store of chunk {id} failed: {e:#}");
+                    }
+                }
+                out[done..done + n].copy_from_slice(&c[local as usize..local as usize + n]);
+            } else {
+                let piece = self.fetch_range(id, local, n as u64)?;
+                out[done..done + n].copy_from_slice(&piece[..n]);
+                self.partial_reads += 1;
+            }
             done += n;
             off += n as u64;
         }
         Ok(())
+    }
+
+    /// Whether a read of `want` bytes inside a `chunk_len` chunk is big enough
+    /// to justify pulling and caching the whole chunk.
+    fn should_cache_whole(&self, chunk_len: u64, want: u64) -> bool {
+        if chunk_len == 0 {
+            return false;
+        }
+        // Treat it as sequential IO once the request covers this much of the
+        // chunk; below that we save bandwidth at the cost of a cache miss.
+        want.saturating_mul(100) >= chunk_len * self.policy.whole_chunk_pct
     }
 
     /// Write `blocks` blocks starting at block offset `blk`.
@@ -376,6 +542,9 @@ impl Volume {
                 },
             );
             self.read_cache.remove(id);
+            if let Some(dc) = self.disk_cache.as_mut() {
+                dc.remove(id);
+            }
         }
         let base = local as usize;
         let w = self.working.get_mut(&id).unwrap();
@@ -449,6 +618,12 @@ impl Volume {
         };
 
         let w = self.working.remove(&id).unwrap();
+        if let Some(dc) = self.disk_cache.as_mut() {
+            // The uploaded bytes are authoritative; keep them cached.
+            if let Err(e) = dc.put(id, &w.data) {
+                log::debug!("read cache store of chunk {id} failed: {e:#}");
+            }
+        }
         self.read_cache.insert(id, w.data);
         self.sent_chunks += 1;
         self.sent_bytes += sent;
@@ -511,6 +686,22 @@ impl Volume {
         self.sent_bytes
     }
 
+    /// How many reads used a byte-range fetch rather than a whole chunk.
+    pub fn partial_reads(&self) -> u64 {
+        self.partial_reads
+    }
+
+    /// On-disk read cache usage as `(used_bytes, max_bytes)`; `None` when the
+    /// disk cache is disabled.
+    pub fn disk_cache_usage(&self) -> Option<(u64, u64)> {
+        self.disk_cache.as_ref().map(|c| (c.used_bytes(), c.max_bytes()))
+    }
+
+    /// Disk read cache hit/miss counters.
+    pub fn disk_cache_stats(&self) -> Option<(u64, u64)> {
+        self.disk_cache.as_ref().map(|c| (c.hits(), c.misses()))
+    }
+
     /// Byte range of a block request, validated against the volume size.
     pub fn check_range(&self, blk: u64, blocks: usize) -> Result<Range<u64>> {
         let start = blk * BLOCK;
@@ -566,6 +757,37 @@ mod tests {
 
     fn blocks(n: usize, v: u8) -> Vec<u8> {
         vec![v; n * BLOCK as usize]
+    }
+
+    /// Populate a volume, flush, then reopen it with empty caches so the next
+    /// read has to come from the object store.
+    fn populate_and_reopen(
+        store: Arc<MemStore>,
+        dir: &std::path::Path,
+        size: u64,
+        fill: impl FnOnce(&mut Volume),
+    ) -> Volume {
+        let meta = dir.join("meta");
+        {
+            let mut v = Volume::open(
+                store.clone(),
+                Box::new(FileMeta::new(&meta)),
+                Layout::new("v"),
+                Some(Create::new(size)),
+                Policy::default(),
+            )
+            .unwrap();
+            fill(&mut v);
+            v.flush().unwrap();
+        }
+        Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta)),
+            Layout::new("v"),
+            None,
+            Policy::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -709,6 +931,7 @@ mod tests {
             full_pct: 50,
             max_age: std::time::Duration::from_secs(3600),
             read_chunks: 4,
+            ..Policy::default()
         };
         let mut v = mem_volume(DEFAULT_CHUNK, policy);
         let half = (DEFAULT_CHUNK / BLOCK / 2) as usize;
@@ -725,11 +948,133 @@ mod tests {
             full_pct: 50,
             max_age: std::time::Duration::from_secs(3600),
             read_chunks: 4,
+            ..Policy::default()
         };
         let mut v = mem_volume(DEFAULT_CHUNK, policy);
         v.write(0, 1, &blocks(1, 3)).unwrap();
         v.tick().unwrap();
         assert_eq!(v.dirty_chunks(), 1, "one dirty block should not upload");
+    }
+
+    /// A small read must not pull a whole chunk: on S3 that is 8 MiB of
+    /// traffic and cache churn for one 4 KiB block.
+    #[test]
+    fn small_read_uses_range_fetch() {
+        let dir = std::env::temp_dir().join(format!("blobdev-rr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(MemStore::new());
+        let mut v = populate_and_reopen(store.clone(), &dir, DEFAULT_CHUNK, |v| {
+            v.write(0, 1, &blocks(1, 0x33)).unwrap();
+        });
+        let before = store.fetched_bytes();
+        let mut buf = vec![0u8; BLOCK as usize];
+        v.read(5, 1, &mut buf).unwrap();
+        let fetched = store.fetched_bytes() - before;
+        assert_eq!(buf[0], 0, "block 5 was never written");
+        assert!(
+            fetched <= BLOCK,
+            "a 4 KiB read fetched {fetched} bytes; expected a range fetch"
+        );
+        assert_eq!(v.partial_reads(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A large (sequential) read still pulls and caches the whole chunk, so a
+    /// second read of the same chunk needs no network at all.
+    #[test]
+    fn large_read_caches_whole_chunk() {
+        let dir = std::env::temp_dir().join(format!("blobdev-lr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(MemStore::new());
+        let half = (DEFAULT_CHUNK / BLOCK / 2) as usize;
+        let mut v = populate_and_reopen(store.clone(), &dir, DEFAULT_CHUNK, |v| {
+            v.write(0, half, &blocks(half, 0x44)).unwrap();
+        });
+
+        let mut buf = vec![0u8; half * BLOCK as usize];
+        v.read(0, half, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x44));
+        let first = store.fetched_bytes();
+        assert!(first >= DEFAULT_CHUNK, "sequential read should pull the chunk");
+
+        v.read(0, half, &mut buf).unwrap();
+        assert_eq!(store.fetched_bytes(), first, "second read caused IO");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Range fetches must not read past the end of a short final chunk.
+    #[test]
+    fn range_read_past_chunk_end_is_zero() {
+        let dir = std::env::temp_dir().join(format!("blobdev-re-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(MemStore::new());
+        let size = DEFAULT_CHUNK + 4 * BLOCK; // final chunk is 4 blocks
+        let mut v = populate_and_reopen(store, &dir, size, |_| {});
+        let mut buf = vec![0xAAu8; 4 * BLOCK as usize];
+        v.read(DEFAULT_CHUNK / BLOCK, 4, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The on-disk cache makes a clean chunk survive a restart.
+    #[test]
+    fn disk_cache_serves_after_reopen() {
+        let dir = std::env::temp_dir().join(format!("blobdev-dc-{}", std::process::id()));
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(MemStore::new());
+        let meta = dir.join("meta");
+
+        {
+            let mut v = Volume::open(
+                store.clone(),
+                Box::new(FileMeta::new(&meta)),
+                Layout::new("v"),
+                Some(Create::new(DEFAULT_CHUNK)),
+                Policy::default(),
+            )
+            .unwrap();
+            v.write(0, 1, &blocks(1, 0x66)).unwrap();
+            v.flush().unwrap();
+            drop(v);
+        }
+        // First run with the disk cache: a sequential read caches the chunk.
+        {
+            let mut v = Volume::open_with_cache(
+                store.clone(),
+                Box::new(FileMeta::new(&meta)),
+                Layout::new("v"),
+                None,
+                Policy::default(),
+                Some(DiskCache::new(&cache_dir, 64 << 20)),
+            )
+            .unwrap();
+            let n = (DEFAULT_CHUNK / BLOCK) as usize;
+            let mut buf = vec![0u8; n * BLOCK as usize];
+            v.read(0, n, &mut buf).unwrap();
+            assert_eq!(buf[0], 0x66);
+        }
+        // Second run: the chunk must come from disk, not the store.
+        let mut v = Volume::open_with_cache(
+            store.clone(),
+            Box::new(FileMeta::new(&meta)),
+            Layout::new("v"),
+            None,
+            Policy::default(),
+            Some(DiskCache::new(&cache_dir, 64 << 20)),
+        )
+        .unwrap();
+        let before = store.fetched_bytes();
+        let n = (DEFAULT_CHUNK / BLOCK) as usize;
+        let mut buf = vec![0u8; n * BLOCK as usize];
+        v.read(0, n, &mut buf).unwrap();
+        assert_eq!(buf[0], 0x66);
+        assert_eq!(
+            store.fetched_bytes(),
+            before,
+            "a restart with a warm disk cache still hit the object store"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

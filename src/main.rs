@@ -17,7 +17,7 @@ use blobdev::meta::FileMeta;
 use blobdev::s3::{S3Config, S3Store};
 use blobdev::store::{DirStore, ObjectStore};
 use blobdev::webdav::{WebDavConfig, WebDavStore};
-use blobdev::volume::{Create, Layout, Policy, Volume};
+use blobdev::volume::{Create, DiskCache, Layout, Policy, Volume};
 
 fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
@@ -45,7 +45,10 @@ options:
   --depth N          queue depth (default 64)
   --full-pct N       upload a chunk when N% of its blocks are dirty (default 50)
   --max-age S        upload a chunk dirty for S seconds (default 30)
-  --read-chunks N    clean chunks kept in memory (default 64)"
+  --read-chunks N    clean chunks kept in memory (default 64)
+  --whole-chunk-pct N  fetch a whole chunk for reads covering N%% of it (default 25)
+  --cache-dir PATH   keep clean chunks on local disk (needs --cache-size)
+  --cache-size SIZE  disk read cache budget, e.g. 20G (0 disables)"
     );
     std::process::exit(2)
 }
@@ -176,15 +179,27 @@ fn run(args: &[String]) -> Result<()> {
             .map(|s| s.parse())
             .transpose()?
             .unwrap_or(64),
+        whole_chunk_pct: arg(args, "--whole-chunk-pct")
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(25),
+    };
+
+    let disk_cache = match (arg(args, "--cache-dir"), arg(args, "--cache-size")) {
+        (Some(dir), Some(sz)) => Some(DiskCache::new(dir, parse_size(&sz)?)),
+        (Some(_), None) => anyhow::bail!("--cache-dir needs --cache-size, e.g. --cache-size 20G"),
+        (None, Some(_)) => anyhow::bail!("--cache-size needs --cache-dir"),
+        (None, None) => None,
     };
 
     let store = build_store(args)?;
-    let volume = Volume::open(
+    let volume = Volume::open_with_cache(
         store,
         Box::new(FileMeta::new(&meta_path)),
         Layout::new(&volume_name),
         create,
         policy,
+        disk_cache,
     )?;
 
     // Block signals before any thread starts, so every thread inherits the mask

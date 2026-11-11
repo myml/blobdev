@@ -51,11 +51,12 @@ impl Geometry {
         if self.chunk_size == 0 || self.size == 0 {
             anyhow::bail!("volume geometry has a zero dimension");
         }
-        if self.size % self.chunk_size != 0 {
+        // The final chunk may be short; it only has to end on a block boundary.
+        if self.size % crate::volume::BLOCK != 0 {
             anyhow::bail!(
-                "volume size {} is not a multiple of chunk size {}",
+                "volume size {} is not a multiple of the {} byte block",
                 self.size,
-                self.chunk_size
+                crate::volume::BLOCK
             );
         }
         if self.chunk_size % crate::volume::BLOCK != 0 {
@@ -316,8 +317,28 @@ mod tests {
 
     #[test]
     fn geometry_validation() {
-        assert!(Geometry { chunk_size: 8 << 20, size: 1 << 20 }.validate().is_err());
+        // A volume smaller than one chunk is fine: the only chunk is short.
+        let small = Geometry {
+            chunk_size: 8 << 20,
+            size: 1 << 20,
+        };
+        assert!(small.validate().is_ok());
+        assert_eq!(small.chunk_len(0), 1 << 20);
+        assert_eq!(small.chunks(), 0, "integer chunk count understates a short tail");
+
         assert!(Geometry { chunk_size: 0, size: 0 }.validate().is_err());
-        assert!(Geometry { chunk_size: 4096, size: 8192 }.validate().is_ok());
+        // Must end on a block boundary.
+        assert!(Geometry { chunk_size: 4096, size: 4096 }.validate().is_ok());
+        assert!(Geometry { chunk_size: 4096, size: 4097 }.validate().is_err());
+        // Chunk size must be a whole number of blocks.
+        assert!(Geometry { chunk_size: 1000, size: 1000 }.validate().is_err());
+
+        // A non-multiple tail: 2.5 chunks.
+        let odd = Geometry {
+            chunk_size: 8 << 20,
+            size: (8 << 20) * 2 + (4 << 20),
+        };
+        assert!(odd.validate().is_ok());
+        assert_eq!(odd.chunk_len(2), 4 << 20);
     }
 }

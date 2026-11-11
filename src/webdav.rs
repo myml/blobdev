@@ -328,6 +328,21 @@ impl Reply {
         }
         msg
     }
+
+    /// The error for a reply the caller cannot use.
+    ///
+    /// The transient flag is what makes the retry policy act: a 503 or a 429
+    /// is the store saying "not now", while a 404 or a 400 is the request
+    /// being wrong and will not improve by asking again. Building these as
+    /// plain strings lost that distinction, so every 503 was final and a
+    /// blip failed the whole upload.
+    fn error(&self, what: &str) -> anyhow::Error {
+        let transient = matches!(self.status, 408 | 429 | 500 | 502 | 503 | 504);
+        anyhow::Error::new(crate::store::StoreError {
+            transient,
+            message: format!("{what}: {}", self.describe()),
+        })
+    }
 }
 
 /// A blocking WebDAV client.
@@ -345,6 +360,9 @@ pub struct WebDavStore {
     /// so the store remembers and reports `partial_write = false` from then
     /// on; the volume then uploads whole objects directly.
     no_ranged_write: std::sync::atomic::AtomicBool,
+    /// Collections this store has already created, so the per-upload MKCOL
+    /// costs one request for the life of the process instead of one per upload.
+    known_collections: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl WebDavStore {
@@ -375,6 +393,7 @@ impl WebDavStore {
             auth,
             agent: config.into(),
             no_ranged_write: std::sync::atomic::AtomicBool::new(false),
+            known_collections: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -483,6 +502,37 @@ impl WebDavStore {
     }
 
     fn mkcol_one(&self, url: &str) -> Result<()> {
+        // A collection only has to be made once. Remembering that turns the
+        // per-upload MKCOL into a single request, and stops a store that keeps
+        // answering 503 from being asked again on every tick -- which is what
+        // it did before: 103 failed MKCOLs, two seconds apart, for as long as
+        // the daemon ran.
+        let key = url.trim_end_matches('/').to_string();
+        if self
+            .known_collections
+            .lock()
+            .map(|set| set.contains(&key))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let result = self.mkcol_uncached(url);
+        if result.is_ok() {
+            if let Ok(mut set) = self.known_collections.lock() {
+                set.insert(url.trim_end_matches('/').to_string());
+            }
+        }
+        result
+    }
+
+    fn mkcol_uncached(&self, url: &str) -> Result<()> {
+        // Going through the retry policy matters here: a 503 from a busy store
+        // is transient, and without it a single blip failed the whole upload.
+        self.retry
+            .run(&format!("MKCOL {url}"), || self.mkcol_reply(url))
+    }
+
+    fn mkcol_reply(&self, url: &str) -> Result<()> {
         let reply = self.request("MKCOL", url, &[], None)?;
         match reply.status {
             200..=299 => Ok(()),
@@ -509,7 +559,7 @@ impl WebDavStore {
                 log::debug!("MKCOL {url} unsupported (501); relying on PUT to create it");
                 Ok(())
             }
-            _ => anyhow::bail!("MKCOL {url}: {}", reply.describe()),
+            _ => return Err(reply.error(&format!("MKCOL {url}"))),
         }
     }
 
@@ -532,7 +582,7 @@ impl WebDavStore {
             // 405/501: no PROPFIND support. Trust the MKCOL answer rather than
             // inventing a failure the caller cannot act on.
             405 | 501 => Ok(true),
-            _ => anyhow::bail!("PROPFIND {target}: {}", reply.describe()),
+            _ => return Err(reply.error(&format!("PROPFIND {target}"))),
         }
     }
 
@@ -563,7 +613,7 @@ impl WebDavStore {
             400..=499 if !matches!(reply.status, 401 | 403 | 407 | 408 | 409 | 429) => {
                 self.propfind_size(key)
             }
-            _ => anyhow::bail!("HEAD {url}: {}", reply.describe()),
+            _ => return Err(reply.error(&format!("HEAD {url}"))),
         }
     }
 
@@ -596,7 +646,7 @@ impl WebDavStore {
             // Servers without PROPFIND (plain file servers sometimes answer
             // 405) cannot report a size; ask for the data instead.
             405 | 501 => Ok(Some((self.measure_by_get(key)?, None))),
-            _ => anyhow::bail!("PROPFIND {url}: {}", reply.describe()),
+            _ => return Err(reply.error(&format!("PROPFIND {url}"))),
         }
     }
 
@@ -619,7 +669,7 @@ impl WebDavStore {
             200 | 206 => Ok(reply.body),
             404 | 410 => Ok(Vec::new()),
             416 => anyhow::bail!("GET {url}: range not satisfiable"),
-            _ => anyhow::bail!("GET {url}: {}", reply.describe()),
+            _ => return Err(reply.error(&format!("GET {url}"))),
         }
     }
 
@@ -657,10 +707,10 @@ impl WebDavStore {
                 )?;
                 match reply.status {
                     200 | 201 | 204 => Ok(reply.etag()),
-                    _ => anyhow::bail!("PUT {url}: {}", reply.describe()),
+                    _ => return Err(reply.error(&format!("PUT {url}"))),
                 }
             }
-            _ => anyhow::bail!("PUT {url}: {}", reply.describe()),
+            _ => return Err(reply.error(&format!("PUT {url}"))),
         }
     }
 
@@ -722,7 +772,7 @@ impl WebDavStore {
                 "ranged PUT {url}: {} (content-range {cr}, object is {total} bytes)",
                 reply.describe()
             ),
-            _ => anyhow::bail!("ranged PUT {url}: {}", reply.describe()),
+            _ => return Err(reply.error(&format!("ranged PUT {url}"))),
         }
     }
 }

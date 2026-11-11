@@ -459,11 +459,23 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
     // StoreError. They mean the link stalled, not that the request was wrong.
     e.chain().any(|c| {
         if let Some(io) = c.downcast_ref::<std::io::Error>() {
-            use std::io::ErrorKind::{ConnectionAborted, ConnectionReset, TimedOut, WouldBlock};
-            return matches!(io.kind(), TimedOut | WouldBlock | ConnectionReset | ConnectionAborted);
+            use std::io::ErrorKind::{
+                BrokenPipe, ConnectionAborted, ConnectionReset, TimedOut, UnexpectedEof, WouldBlock,
+            };
+            // BrokenPipe and UnexpectedEof belong here for the same reason as a
+            // reset: the peer went away mid-request. A store that answers 503
+            // and hangs up produces exactly that.
+            return matches!(
+                io.kind(),
+                TimedOut | WouldBlock | ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
+            );
         }
         let msg = c.to_string().to_ascii_lowercase();
-        msg.contains("timeout") || msg.contains("timed out")
+        msg.contains("timeout")
+            || msg.contains("timed out")
+            || msg.contains("broken pipe")
+            || msg.contains("connection reset")
+            || msg.contains("unexpected eof")
     })
 }
 
@@ -576,5 +588,55 @@ mod timeout_tests {
         // string matching, so a bare message must not be called transient.
         let e = anyhow::anyhow!("connection refused");
         assert!(!is_transient(&e));
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::*;
+
+    fn err_of(e: anyhow::Error) -> bool {
+        is_transient(&e)
+    }
+
+    /// A server that answers 503 or hangs up mid-request is saying "not now".
+    ///
+    /// WebDAV built these as plain strings, which carried no transient flag,
+    /// so the retry policy never ran and one blip failed the whole upload.
+    #[test]
+    fn a_server_that_says_not_now_is_retried() {
+        for status in [408u16, 429, 500, 502, 503, 504] {
+            let e = anyhow::Error::new(StoreError {
+                transient: true,
+                message: format!("HTTP {status}"),
+            });
+            assert!(err_of(e), "HTTP {status} should be retried");
+        }
+        for status in [400u16, 401, 403, 404, 409, 501] {
+            let e = anyhow::Error::new(StoreError {
+                transient: false,
+                message: format!("HTTP {status}"),
+            });
+            assert!(!err_of(e), "HTTP {status} should not be retried");
+        }
+    }
+
+    /// A connection that dies mid-exchange is retried too.
+    #[test]
+    fn a_dropped_connection_is_retried() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::TimedOut,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let e = anyhow::Error::new(Error::from(kind));
+            assert!(err_of(e), "{kind:?} should be retried");
+        }
+        // A request the server rejected as wrong will not improve.
+        let e = anyhow::Error::new(Error::from(ErrorKind::InvalidInput));
+        assert!(!err_of(e));
     }
 }

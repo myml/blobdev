@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::sync::Arc;
 
 use blobdev::meta::{FileMeta, MetaStore};
@@ -57,7 +58,8 @@ options:
   --whole-chunk-pct N  fetch a whole chunk for reads covering N% of it (default 25)
   --cache-dir PATH   keep clean chunks on local disk; enables read caching
   --cache-size SIZE  disk read cache budget, e.g. 20G (default 64M, 0 disables)
-  --retries N        attempts per request on transient failures (default 4)"
+  --retries N        attempts per request on transient failures (default 4)
+  --timeout S        per-request timeout in seconds, 0 for none (default 60)"
     );
     std::process::exit(2)
 }
@@ -66,6 +68,15 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Parse a request timeout in seconds; `0` means no limit.
+fn parse_timeout(s: &str) -> Result<Option<Duration>> {
+    let secs: u64 = s.trim().parse().context("bad --timeout, expected seconds")?;
+    Ok(match secs {
+        0 => None,
+        n => Some(Duration::from_secs(n)),
+    })
 }
 
 /// Parse sizes like `1G`, `500M`, `4096`.
@@ -136,6 +147,9 @@ fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
             if let Some(p) = arg(args, "--key-prefix") {
                 cfg = cfg.with_prefix(p);
             }
+            if let Some(t) = arg(args, "--timeout") {
+                cfg.timeout = parse_timeout(&t)?;
+            }
             // Self-hosted endpoints (MinIO, RustFS) need path-style, which is
             // the default because it never depends on wildcard DNS. AWS and
             // other wildcard-DNS deployments want --virtual-host-style.
@@ -162,6 +176,9 @@ fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
             let mut cfg = WebDavConfig::new(endpoint);
             if let (Some(u), Some(pw)) = (arg(args, "--user"), arg(args, "--password")) {
                 cfg = cfg.with_auth(u, pw);
+            }
+            if let Some(t) = arg(args, "--timeout") {
+                cfg.timeout = parse_timeout(&t)?;
             }
             if let Some(p) = arg(args, "--key-prefix") {
                 cfg = cfg.with_prefix(p);

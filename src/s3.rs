@@ -55,6 +55,8 @@ pub struct S3Config {
     /// `http://host:9000/bucket/key` instead of `http://bucket.host/key`.
     /// Must be `true` for MinIO and RustFS.
     pub path_style: bool,
+    /// Wall-clock limit for one request, including the body.
+    pub timeout: Option<std::time::Duration>,
     /// Key namespace inside the bucket; `""` for the bucket root.
     pub prefix: String,
 }
@@ -76,6 +78,7 @@ impl S3Config {
             secret_access_key: secret_access_key.into(),
             session_token: None,
             path_style: true,
+            timeout: Some(std::time::Duration::from_secs(60)),
             prefix: String::new(),
         }
     }
@@ -416,6 +419,10 @@ impl S3Store {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
+            // Without a timeout a stalled connection holds a queue thread
+            // forever, and the volume stops serving blocks. Retries handle a
+            // slow request; this only bounds the wait.
+            .timeout_global(cfg.timeout)
             .build()
             .into();
         Ok(S3Store {

@@ -438,10 +438,22 @@ impl StoreError {
 
 /// Whether an error, or any error in its context chain, is worth retrying.
 pub fn is_transient(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
+    if e.chain().any(|c| {
         c.downcast_ref::<StoreError>()
             .map(|s| s.transient)
             .unwrap_or(false)
+    }) {
+        return true;
+    }
+    // The HTTP client reports its own timeouts and resets, which carry no
+    // StoreError. They mean the link stalled, not that the request was wrong.
+    e.chain().any(|c| {
+        if let Some(io) = c.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::{ConnectionAborted, ConnectionReset, TimedOut, WouldBlock};
+            return matches!(io.kind(), TimedOut | WouldBlock | ConnectionReset | ConnectionAborted);
+        }
+        let msg = c.to_string().to_ascii_lowercase();
+        msg.contains("timeout") || msg.contains("timed out")
     })
 }
 
@@ -532,5 +544,27 @@ mod retry_tests {
             "must cap at max_delay"
         );
         assert_eq!(r.delay(10), None, "no delay once attempts are exhausted");
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// A timeout is the one error class that says nothing about the object
+    /// store's health: a flaky link and a wedged server look identical. It is
+    /// worth one retry, so it must be classified as transient.
+    #[test]
+    fn a_timeout_is_worth_retrying() {
+        let e = anyhow::anyhow!("timeout: global");
+        assert!(is_transient(&e), "a timeout should be retried");
+    }
+
+    #[test]
+    fn a_refusal_is_not_retried_by_message_alone() {
+        // Connection refused is handled by the caller's error type, not by
+        // string matching, so a bare message must not be called transient.
+        let e = anyhow::anyhow!("connection refused");
+        assert!(!is_transient(&e));
     }
 }

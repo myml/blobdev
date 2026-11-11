@@ -488,6 +488,27 @@ impl Volume {
     /// Rebuild working copies from metadata left by an earlier run, so dirty
     /// blocks recorded there get uploaded on the next flush.
     fn restore(&mut self, snap: Snapshot) -> Result<()> {
+        // Validate before touching any state. A dirty block index past the end
+        // of its object would index out of bounds later, and an object index
+        // past the end of the volume would address storage that does not
+        // exist; both mean the metadata and the geometry disagree (a truncated
+        // file, a half-written record, or a geometry that was changed under it).
+        let nobjects = snap.geometry.size.div_ceil(snap.geometry.object_size).max(1);
+        for (id, st) in &snap.chunks {
+            if *id >= nobjects {
+                anyhow::bail!(
+                    "metadata names object {id}, but the volume only has {nobjects}; \
+                     the metadata does not match this volume's geometry"
+                );
+            }
+            let blocks = snap.geometry.object_len(*id).div_ceil(BLOCK);
+            if let Some(bad) = st.dirty.keys().find(|b| **b >= blocks) {
+                anyhow::bail!(
+                    "metadata marks block {bad} of object {id} dirty, but that object \
+                     has only {blocks} blocks; the metadata is corrupt"
+                );
+            }
+        }
         let nchunks = snap.chunks.values().filter(|s| !s.dirty.is_empty()).count();
         let nblocks: usize = snap.chunks.values().map(|s| s.dirty.len()).sum();
         // Every chunk present in the store has a committed object uid.

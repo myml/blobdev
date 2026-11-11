@@ -4,11 +4,12 @@
 //! directory backend, so the chunk/upload/restore logic is exercised without
 //! needing the ublk kernel driver.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use blobdev::meta::{FileMeta, Geometry};
+use blobdev::meta::{ChunkState, FileMeta, Geometry, MetaStore, Snapshot};
 use blobdev::store::{Caps, ObjectStore};
-use blobdev::store::DirStore;
+use blobdev::store::{DirStore, MemStore};
 use blobdev::volume::{Create, Layout, Policy, Volume, BLOCK, DEFAULT_CHUNK};
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -750,5 +751,75 @@ fn partial_write_backend_creates_missing_object_without_losing_blocks() {
         v.read(blk, 1, &mut buf).unwrap();
         assert_eq!(buf[0], 0, "block {blk} should be zero");
     }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Metadata that disagrees with the geometry must be rejected, not acted on.
+///
+/// A dirty block past the end of its object would index out of bounds, and an
+/// object past the end of the volume addresses storage that does not exist.
+/// Both come from a truncated file or a geometry change, and both are much
+/// easier to diagnose as a clear error at open time than as an out-of-range
+/// write later.
+#[test]
+fn metadata_with_out_of_range_indices_is_rejected() {
+    let root = tmpdir("metabad");
+    let meta_path = root.join("meta");
+    let geometry = blobdev::meta::Geometry {
+        chunk_size: DEFAULT_CHUNK,
+        object_size: blobdev::volume::DEFAULT_OBJECT,
+        size: DEFAULT_CHUNK,
+    };
+
+    let mut bad_block = Snapshot::new(geometry.clone());
+    bad_block.chunks.insert(
+        0,
+        ChunkState {
+            dirty: [(999_999u64, ())].into_iter().collect(),
+            uploaded: true,
+            uid: 7,
+        },
+    );
+    FileMeta::new(&meta_path)
+        .save(&bad_block)
+        .unwrap();
+    let err = match Volume::open(
+        Arc::new(MemStore::new()),
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    ) {
+        Ok(_) => panic!("out-of-range block index was accepted"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("corrupt"), "unhelpful error: {err}");
+
+    let mut bad_object = Snapshot::new(geometry);
+    bad_object.chunks.insert(
+        5000,
+        ChunkState {
+            dirty: BTreeMap::new(),
+            uploaded: true,
+            uid: 9,
+        },
+    );
+    FileMeta::new(&meta_path)
+        .save(&bad_object)
+        .unwrap();
+    let err = match Volume::open(
+        Arc::new(MemStore::new()),
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    ) {
+        Ok(_) => panic!("out-of-range object index was accepted"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("geometry"),
+        "the error should mention the geometry: {err}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }

@@ -175,6 +175,7 @@ scripts/e2e-s3.sh                # 端到端（S3，需先准备服务端）
 scripts/e2e-webdav.sh            # 端到端（WebDAV）
 scripts/stress.sh                # 长跑：持续写 + 每轮校验 + 重启复核
 scripts/crash-test.sh            # 断电：写入途中随机 kill -9，验证恢复
+scripts/restart-cycles.sh        # 反复重启同一卷，验证累积数据不丢
 scripts/webdav_server.py DIR     # 本地 WebDAV 测试服务端（纯标准库）
 ```
 
@@ -197,6 +198,7 @@ scripts/webdav_server.py DIR     # 本地 WebDAV 测试服务端（纯标准库�
 | **长跑**：WebDAV 连续 90 秒写入并校验 | **721 轮**，0 错误，重启复核通过 |
 | **断电**：写入中随机 `kill -9` × 4 轮 | 每轮重启后卷可用，历史数据完好 |
 | **写放大**：100 MiB 写入后 drop 页缓存 + 重启复核 | 通过，对象为 4 MiB |
+| **反复重启**：同一卷 4 轮，每轮加数据 | 通过，历史文件逐轮完好 |
 | WebDAV：写 40 MiB → flush → 重启重读 | 通过，sha256 一致 |
 | S3（RustFS）：写 80 MiB → flush → 重启重读 | 通过，sha256 一致，0 错误 |
 | S3：写 512 MiB（4 个文件）→ 重启重读 | 通过，写入耗时 2 秒（不等待上传） |

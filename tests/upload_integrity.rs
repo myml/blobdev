@@ -500,7 +500,7 @@ fn patched_objects_do_not_alias_object_zero() {
     let objects = root.join("objects");
     let meta_path = root.join("meta");
     let size = 4 * DEFAULT_CHUNK;
-    let obj_blocks = (blobdev::volume::DEFAULT_OBJECT / BLOCK) as u64;
+    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
     let n = (obj_blocks * 3) as usize;
     // Each block carries its own index, so a shifted read is obvious.
     let mut data = vec![0u8; n * BLOCK as usize];

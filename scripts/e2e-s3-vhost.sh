@@ -7,7 +7,12 @@
 # only correct for path-style fails here with SignatureDoesNotMatch.
 #
 # Needs DNS: either wildcard DNS for the endpoint, or an /etc/hosts entry such
-#   as `127.0.0.1 blobtest.127.0.0.1` for a local server.
+#   as `127.0.0.1 blobtest.127.0.0.1` for a local server. It also needs a
+#   server that resolves the bucket from the Host header; RustFS does not, so
+#   scripts/vhost_s3_server.py exists for exactly this case:
+#
+#     python3 scripts/vhost_s3_server.py 18090 /tmp/vhostroot .127.0.0.1 &
+#     EP=http://127.0.0.1:18090 e2e-s3-vhost.sh
 #
 # usage: EP=http://127.0.0.1:9000 e2e-s3-vhost.sh
 set +e

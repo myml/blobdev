@@ -259,20 +259,31 @@ fn run(args: &[String]) -> Result<()> {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGHUP);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
     let drain = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
+    // SIGINT/SIGTERM: flush, then exit (services must be stoppable).
+    // SIGHUP: flush only, keeping the device up for a mounted filesystem.
+    let exit_after = Arc::new(blobdev::ublk_tgt::ExitRequest::default());
 
     {
         let drain = drain.clone();
+        let exit_after = exit_after.clone();
         std::thread::spawn(move || loop {
             let mut sig: libc::c_int = 0;
             let rc = unsafe { libc::sigwait(&set, &mut sig) };
-            if rc == 0 {
-                log::info!("signal {sig}: flushing");
-                drain.store(true, Ordering::SeqCst);
+            if rc != 0 {
+                continue;
             }
+            if sig == libc::SIGINT || sig == libc::SIGTERM {
+                log::info!("signal {sig}: flushing, then exiting");
+                exit_after.request();
+            } else {
+                log::info!("signal {sig}: flushing (device stays up)");
+            }
+            drain.store(true, Ordering::SeqCst);
         });
     }
 
@@ -291,7 +302,7 @@ fn run(args: &[String]) -> Result<()> {
             .unwrap_or(64),
         interval: std::time::Duration::from_secs(1),
     };
-    target.run(volume, drain, stop)
+    target.run(volume, drain, stop, exit_after)
 }
 
 /// Show the metadata a volume would use, and whether it is consistent.

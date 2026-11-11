@@ -45,6 +45,7 @@ impl Target {
         volume: Volume,
         drain: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
+        exit_after: Arc<ExitRequest>,
     ) -> Result<()> {
         let dev_size = volume.size();
         log::info!(
@@ -128,7 +129,7 @@ impl Target {
         let st = stop.clone();
         let device_fn = move |c: &UblkCtrl| {
             log::info!("created /dev/ublkb{}", c.dev_info().dev_id);
-            spawn_drain_watcher(s.volume.clone(), d, st);
+            spawn_drain_watcher(s.volume.clone(), d, st, exit_after.clone());
         };
 
         let _ = ctrl.run_target(tgt_init, q_fn, device_fn);
@@ -187,7 +188,12 @@ fn spawn_maintenance(
 
 /// React to SIGINT/SIGTERM by flushing, not by tearing the device down: a
 /// mounted filesystem still needs this device to answer IO.
-fn spawn_drain_watcher(volume: Arc<Mutex<Volume>>, drain: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+fn spawn_drain_watcher(
+    volume: Arc<Mutex<Volume>>,
+    drain: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    exit_after: Arc<ExitRequest>,
+) {
     thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
             if drain.swap(false, Ordering::SeqCst) {
@@ -196,10 +202,36 @@ fn spawn_drain_watcher(volume: Arc<Mutex<Volume>>, drain: Arc<AtomicBool>, stop:
                     Ok(()) => log::info!("signal: flushed dirty chunks"),
                     Err(e) => log::error!("signal: flush failed: {e:#}"),
                 }
+                // A signal must be able to stop the service. Flush first so
+                // nothing is lost, then exit: tearing the device down from
+                // this thread used to deadlock, so the process exits and the
+                // kernel removes the device when its handles close.
+                if exit_after.is_requested() {
+                    log::info!("signal: exiting after flushing");
+                    std::process::exit(0);
+                }
             }
             thread::sleep(Duration::from_millis(100));
         }
     });
+}
+
+/// Whether the process should exit once the journal is flushed.
+#[derive(Default)]
+pub struct ExitRequest {
+    /// Set when a signal should terminate the process rather than only flush.
+    requested: std::sync::atomic::AtomicBool,
+}
+
+impl ExitRequest {
+    /// Ask for the process to exit once pending data is flushed.
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
 }
 
 fn handle_command(

@@ -169,11 +169,13 @@ systemctl enable --now blobdev@data
 ## 测试
 
 ```bash
-cargo test                      # 51 单元 + 4 集成测试，不需要网络和内核支持
-scripts/e2e-dir.sh              # 端到端（目录后端）
-scripts/e2e-s3.sh               # 端到端（S3，需先准备服务端）
-scripts/e2e-webdav.sh           # 端到端（WebDAV）
-scripts/webdav_server.py DIR    # 本地 WebDAV 测试服务端（纯标准库）
+cargo test                       # 70 单元 + 12 集成测试，不需要网络和内核支持
+scripts/e2e-dir.sh               # 端到端（目录后端）
+scripts/e2e-s3.sh                # 端到端（S3，需先准备服务端）
+scripts/e2e-webdav.sh            # 端到端（WebDAV）
+scripts/stress.sh                # 长跑：持续写 + 每轮校验 + 重启复核
+scripts/crash-test.sh            # 断电：写入途中随机 kill -9，验证恢复
+scripts/webdav_server.py DIR     # 本地 WebDAV 测试服务端（纯标准库）
 ```
 
 端到端脚本都需要 root 和 ublk，会验证：设备容量、mkfs/mount、写入、
@@ -191,6 +193,9 @@ scripts/webdav_server.py DIR    # 本地 WebDAV 测试服务端（纯标准库�
 | S3：写 48 MiB 后重启（drop 页缓存） | 通过，13 个 chunk 直接来自本地缓存 |
 | S3：`gc` 识别并删除孤儿，不误删引用中的对象 | 通过（5 引用保留、2 孤儿删除） |
 | 两个进程抢同一卷 | 通过，第二个被拒绝并提示持有者 PID |
+| **长跑**：S3 连续 120 秒写入并校验 | **992 轮**，0 错误，重启复核通过 |
+| **长跑**：WebDAV 连续 90 秒写入并校验 | **721 轮**，0 错误，重启复核通过 |
+| **断电**：写入中随机 `kill -9` × 4 轮 | 每轮重启后卷可用，历史数据完好 |
 | WebDAV：写 40 MiB → flush → 重启重读 | 通过，sha256 一致 |
 | S3（RustFS）：写 80 MiB → flush → 重启重读 | 通过，sha256 一致，0 错误 |
 | S3：写 512 MiB（4 个文件）→ 重启重读 | 通过，写入耗时 2 秒（不等待上传） |

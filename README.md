@@ -142,7 +142,8 @@ WebDAV 支持 `Content-Range`，可以只写改动的部分。**
   单位是 object 不是 chunk：一个 64 MiB 的 chunk 里有 16 个 object
 - **磁盘缓存**（`--cache-dir` + `--cache-size`）：**重启后仍然命中**，容量不受内存限制
 
-磁盘缓存每个 chunk 一个文件，带 CRC 和长度校验；**校验失败只当未命中并重删**，
+磁盘缓存每个 **object** 一个文件（不是 chunk：64 MiB 的 chunk 里有 16 个 object），
+带 CRC 和长度校验；**校验失败只当未命中并重删**，
 绝不会把损坏数据返回给上层。写入走临时文件 + rename，崩溃不会留下半截文件。
 
 **磁盘缓存值多少**：实测（Nextcloud，32 MiB 文件，`--read-chunks 1` 让内存只留

@@ -1,22 +1,26 @@
 //! On-disk read cache.
 //!
-//! Clean chunks fetched from the object store are kept as files under a
-//! directory, so a restart does not begin with an empty cache and the cache
-//! can be much larger than RAM.
+//! Clean objects fetched from the store are kept as files under a directory,
+//! so a restart does not begin with an empty cache and the cache can be much
+//! larger than RAM.
+//!
+//! The unit is the **object**, not the chunk: a chunk is a logical range of
+//! the volume and holds several objects (16 at the defaults, 64 MiB of
+//! chunks against 4 MiB objects). Every file here is one object.
 //!
 //! Layout:
 //!
 //! ```text
-//! <dir>/<volume>/<chunk-id>   [32-byte header][chunk bytes]
+//! <dir>/<volume>/<object-id>   [32-byte header][object bytes]
 //! ```
 //!
-//! The header carries a magic, the chunk length, a generation counter (for
+//! The header carries a magic, the object length, a generation counter (for
 //! LRU eviction) and a CRC of the payload. A file that fails its checksum is
 //! treated as absent and rewritten: a corrupt cache must never serve data,
 //! it may only cost a refetch.
 //!
 //! Writes go to a temporary file that is renamed into place, so a crash
-//! mid-write cannot leave a half-written chunk visible.
+//! mid-write cannot leave a half-written entry visible.
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};

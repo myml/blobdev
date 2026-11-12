@@ -920,3 +920,94 @@ fn a_failed_upload_backs_off_and_then_forgets() {
     assert_eq!(got, buf, "the data was lost while the upload was failing");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Opening a volume must not cost a round trip per object.
+///
+/// Deciding the key spelling probed every uid-keyed object, twice each. A
+/// 1 TiB volume whose filesystem had touched 801 objects spent over six
+/// minutes opening, talking to the store, before the device appeared. The
+/// decision is settled by a handful of agreeing objects, so a sample is
+/// enough.
+#[test]
+fn opening_a_large_volume_does_not_probe_every_object() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct Counting {
+        inner: DirStore,
+        stats: Arc<AtomicU32>,
+    }
+    impl ObjectStore for Counting {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+            self.inner.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.inner.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
+
+    // Enough objects that probing all of them would be obvious.
+    let n_objects = 48u64;
+    {
+        let store = Arc::new(Counting {
+            inner: DirStore::new(&objects).unwrap(),
+            stats: Arc::new(AtomicU32::new(0)),
+        });
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(64 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        // One block in every object, so each has its own committed uid.
+        for i in 0..n_objects {
+            let blk = i * obj_blocks + 1;
+            v.write(blk, 1, &[i as u8; BLOCK as usize]).unwrap();
+            v.flush().unwrap();
+        }
+    }
+
+    let stats = Arc::new(AtomicU32::new(0));
+    let store = Arc::new(Counting {
+        inner: DirStore::new(&objects).unwrap(),
+        stats: stats.clone(),
+    });
+    let v = Volume::open(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    drop(v);
+
+    let calls = stats.load(Ordering::SeqCst);
+    assert!(
+        calls <= 2 * 16,
+        "opening asked the store for {calls} objects; a sample should settle the \
+         spelling and a large volume must not pay a round trip per object"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

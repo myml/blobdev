@@ -542,10 +542,22 @@ impl Volume {
         let mut both = 0u32;
         let mut neither = Vec::new();
         let mut undecided = false;
+        // Deciding the spelling needs a sample, not a census.
+        //
+        // Probing every object cost two round trips each. A 1 TiB volume whose
+        // filesystem had touched 801 objects spent over six minutes opening,
+        // talking to the store, before the device appeared -- for a decision
+        // that the first few agreeing objects already settle.
+        const PROBE_LIMIT: usize = 12;
+        let mut probed = 0usize;
         for (id, st) in &snap.chunks {
+            if probed >= PROBE_LIMIT {
+                break;
+            }
             if !st.uploaded || st.uid == 0 {
                 continue;
             }
+            probed += 1;
             // A store that cannot answer is not a reason to refuse to start.
             // Refusing meant a volume could not be opened at all during an
             // outage, when the read cache and metadata are still perfectly

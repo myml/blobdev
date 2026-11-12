@@ -1426,7 +1426,7 @@ fn a_small_read_fetches_only_the_range_it_needs() {
             Box::new(FileMeta::new(&meta_path)),
             Layout::new("vol"),
             None,
-            policy.clone(),
+            policy,
         )
         .unwrap();
         let want = kib * 1024;

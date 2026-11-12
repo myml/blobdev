@@ -33,6 +33,7 @@ STATE = {
     "injected": 0,
     "pass": 0,
     "by_kind": {},
+    "by_route": {},
 }
 LOCK = threading.Lock()
 
@@ -66,9 +67,14 @@ class Proxy(http.server.BaseHTTPRequestHandler):
 
     def stats_page(self):
         with LOCK:
-            body = "".join(f"{k}={v}\n" for k, v in STATE.items() if k != "by_kind")
+            body = "".join(
+                f"{k}={v}\n" for k, v in STATE.items() if k not in ("by_kind", "by_route")
+            )
             for k, v in sorted(STATE["by_kind"].items()):
                 body += f"kind_{k}={v}\n"
+            for k, v in sorted(STATE["by_route"].items()):
+                safe = k.replace(" ", "_").replace("/", ".")
+                body += f"route_{safe}={v}\n"
         data = body.encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(data)))
@@ -76,6 +82,9 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def handle_any(self):
+        # The counters must not count themselves: a test polls this endpoint
+        # while measuring traffic, and counting the polls turns the
+        # measurement into the thing being measured.
         if self.path == "/stats":
             return self.stats_page()
 
@@ -143,6 +152,10 @@ class Proxy(http.server.BaseHTTPRequestHandler):
 
         with LOCK:
             STATE["pass"] += 1
+            route = f"{self.command} {self.path.rsplit('/', 1)[-1] or '/'}"
+            if route.endswith("/c") or "/c/" in route:
+                route = f"{self.command} /c"
+            STATE["by_route"][route] = STATE["by_route"].get(route, 0) + 1
         self.send_response(resp.status)
         for k, v in resp.getheaders():
             if k.lower() in ("content-length", "connection", "transfer-encoding"):

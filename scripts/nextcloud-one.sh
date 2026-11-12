@@ -107,8 +107,11 @@ sleep 3
 DEV2=$(start log2) || die "start 2"
 step "device 2: $DEV2"
 
-sleep 2
-for _ in $(seq 1 40); do mount -o ro "$DEV2" "$MNT" 2>/dev/null && break; sleep 0.5; done
+# The device answers reads as soon as it appears, but a read-only mount also
+# has to fetch the superblock through the cache; give it room rather than
+# reporting a data problem when the store is simply slow.
+sleep 3
+for _ in $(seq 1 120); do mount -o ro "$DEV2" "$MNT" 2>/dev/null && break; sleep 0.5; done
 mountpoint -q "$MNT" || { tail -5 "$W/log2" >&2; die "remount"; }
 
 GOT=$(sha256sum "$MNT/a.bin" | awk '{print $1}')

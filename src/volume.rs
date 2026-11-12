@@ -392,6 +392,8 @@ pub struct Volume {
     uids: HashMap<u64, u32>,
     /// Next uid to hand out.
     next_uid: u32,
+    /// When a failed upload may be retried, per object.
+    backoff: HashMap<u64, std::time::Instant>,
     /// True for volumes written before uid-keyed objects got their `u` prefix.
     legacy_uid_keys: bool,
     /// Objects superseded by a committed upload, awaiting deletion.
@@ -492,6 +494,7 @@ impl Volume {
             partial_reads: 0,
             uids: HashMap::new(),
             next_uid: 1,
+            backoff: HashMap::new(),
             legacy_uid_keys: false,
             garbage: Vec::new(),
             reclaimed: 0,
@@ -965,8 +968,37 @@ impl Volume {
     /// makes an interrupted upload harmless: the old object stays untouched
     /// until the new one is committed.
     fn upload(&mut self, id: u64) -> Result<u64> {
+        let out = self.upload_inner(id);
+        match &out {
+            Ok(_) => {
+                self.backoff.remove(&id);
+            }
+            Err(_) => {
+                self.backoff.insert(
+                    id,
+                    std::time::Instant::now() + std::time::Duration::from_secs(10),
+                );
+            }
+        }
+        out
+    }
+
+    fn upload_inner(&mut self, id: u64) -> Result<u64> {
         if !self.working.contains_key(&id) {
             return Ok(0);
+        }
+
+        // A store that is refusing everything gets a rest. Without this the
+        // daemon re-attempts on every FLUSH, which a filesystem whose writes
+        // are failing sends about once a second -- 40 requests in 40 idle
+        // seconds, each one doomed, for as long as the client keeps trying.
+        // The data stays in the working copy and goes up on a later call.
+        if let Some(until) = self.backoff.get(&id) {
+            if *until > std::time::Instant::now() {
+                anyhow::bail!(
+                    "object {id}: last upload failed, waiting before trying again"
+                );
+            }
         }
 
         // Ask the store each time: a backend that has just discovered it

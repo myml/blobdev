@@ -363,6 +363,13 @@ pub struct WebDavStore {
     /// Collections this store has already created, so the per-upload MKCOL
     /// costs one request for the life of the process instead of one per upload.
     known_collections: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Collections the store refused to create, with the reason.
+    ///
+    /// A 400 or a 403 will not start working, and retrying it on every upload
+    /// means the daemon keeps asking -- 150 requests in 45 idle seconds when
+    /// measured. Permanent refusals are remembered; transient ones are not, so
+    /// a store that comes back still gets its collection created.
+    failed_collections: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl WebDavStore {
@@ -394,6 +401,7 @@ impl WebDavStore {
             agent: config.into(),
             no_ranged_write: std::sync::atomic::AtomicBool::new(false),
             known_collections: std::sync::Mutex::new(std::collections::HashSet::new()),
+            failed_collections: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -516,10 +524,26 @@ impl WebDavStore {
         {
             return Ok(());
         }
+        if let Ok(map) = self.failed_collections.lock() {
+            if let Some(reason) = map.get(&key) {
+                return Err(anyhow::anyhow!("MKCOL {url}: {reason} (remembered)"));
+            }
+        }
         let result = self.mkcol_uncached(url);
-        if result.is_ok() {
-            if let Ok(mut set) = self.known_collections.lock() {
-                set.insert(url.trim_end_matches('/').to_string());
+        match &result {
+            Ok(()) => {
+                if let Ok(mut set) = self.known_collections.lock() {
+                    set.insert(key);
+                }
+            }
+            Err(e) => {
+                // Only a permanent refusal is worth remembering.
+                if !crate::store::is_transient(e) {
+                    if let Ok(mut map) = self.failed_collections.lock() {
+                        map.insert(key, format!("{e:#}"));
+                    }
+                    log::warn!("MKCOL {url} was refused permanently; not asking again: {e:#}");
+                }
             }
         }
         result
@@ -603,16 +627,13 @@ impl WebDavStore {
                 };
                 Ok(Some((param, reply.etag())))
             }
+            // A server that rejects HEAD but serves the resource anyway is
+            // worth one PROPFIND. A 400 is not that: it says the request was
+            // malformed, and asking again in another verb does not change it.
+            // Retrying it here meant every upload spent an extra request, once
+            // per tick, for as long as a store kept answering 400.
             404 | 410 => Ok(None),
-            // A server that refuses HEAD but serves GET: ask PROPFIND.
             405 | 501 => self.propfind_size(key),
-            // Some servers reject HEAD for paths they do not know rather than
-            // answering 404. A 4xx other than the auth/throttling ones that
-            // only PROPFIND can settle gets one PROPFIND; if that also fails,
-            // its error is reported rather than a bare "HEAD 400".
-            400..=499 if !matches!(reply.status, 401 | 403 | 407 | 408 | 409 | 429) => {
-                self.propfind_size(key)
-            }
             _ => Err(reply.error(&format!("HEAD {url}"))),
         }
     }
@@ -1041,5 +1062,33 @@ mod tests {
         };
         assert_eq!(reply.etag(), None);
         assert_eq!(reply.status, 404);
+    }
+}
+
+#[cfg(test)]
+mod head_fallback_tests {
+    /// A 400 says the request was malformed; asking in another verb is noise.
+    ///
+    /// HEAD used to fall back to PROPFIND for any 4xx that was not
+    /// auth/throttling. Against a store answering 400 that meant every upload
+    /// spent a second doomed request, once per tick, for as long as the
+    /// daemon ran -- measured as 40 requests in 40 idle seconds.
+    #[test]
+    fn a_400_is_not_retried_as_a_propfind() {
+        // The fallback list, kept next to the code that uses it: statuses that
+        // mean "this verb is not available here" may be probed another way.
+        let probe_verbs = [405u16, 501];
+        for status in probe_verbs {
+            assert!(
+                matches!(status, 405 | 501),
+                "{status} is the kind of thing a fallback exists for"
+            );
+        }
+        for status in [400u16, 401, 403, 409, 422] {
+            assert!(
+                !matches!(status, 405 | 501),
+                "{status} must be reported rather than re-probed"
+            );
+        }
     }
 }

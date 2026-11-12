@@ -97,6 +97,7 @@ echo "== load"
   run_step "concurrency 4 writers" /tmp/concurrent.sh 60 4
   # Several volumes and the commands that manage them while they run.
   run_step "multiple volumes" /tmp/multivolume.sh
+  run_step "contended writes" /tmp/contention.sh
   # Size, not just correctness: 1 GiB of data on a 5 GiB volume.
   run_step "real scale 1 GiB" /tmp/realscale.sh dir
   run_step_env "stress 2 min" \

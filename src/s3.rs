@@ -825,7 +825,14 @@ impl S3Store {
             EMPTY_SHA256,
             &now,
         )?;
-        let reply = self.send(&signed, &[])?;
+        // Through the retry policy like every other request. Without it a
+        // store that was merely slow to answer at startup failed the whole
+        // run after one attempt: measured against a listener that accepts
+        // and never replies, --retries 1, 2 and 4 all gave up in ~1 s, the
+        // time of a single timeout.
+        let reply = self
+            .retry
+            .run(&format!("LIST {uri}"), || self.send(&signed, &[]))?;
         match reply.status {
             200 => {
                 let body = String::from_utf8_lossy(&reply.body);
@@ -1454,5 +1461,60 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     #[test]
     fn empty_payload_hash_is_the_sha_of_nothing() {
         assert_eq!(sha256_hex(b""), EMPTY_SHA256);
+    }
+}
+
+/// A store that accepts and never answers must be retried.
+///
+/// check_bucket() used the raw send, so --retries had no effect on the very
+/// first request of a run: measured against a listener that accepts and
+/// hangs, --retries 1, 2 and 4 all gave up after one timeout. After the fix
+/// the same run took 1.0 s, 2.2 s and 5.5 s respectively.
+#[cfg(test)]
+mod bucket_check_tests {
+    use super::*;
+    use crate::store::Retry;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_hung_store_is_retried_at_startup() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Hold every connection open without replying.
+            let mut held = Vec::new();
+            for c in listener.incoming().flatten() {
+                held.push(c);
+                if held.len() > 8 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(20));
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut cfg = S3Config::new(
+            format!("http://127.0.0.1:{port}"),
+            "us-east-1".to_string(),
+            "b".to_string(),
+            "k".to_string(),
+            "s".to_string(),
+        );
+        cfg.timeout = Some(Duration::from_millis(300));
+        let store = S3Store::new(cfg).unwrap().with_retry(Retry {
+            attempts: 3,
+            base_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(100),
+        });
+        let t0 = Instant::now();
+        let r = store.check_bucket();
+        let took = t0.elapsed();
+        assert!(r.is_err(), "a store that never answers should fail");
+        assert!(
+            took >= Duration::from_millis(900),
+            "check_bucket gave up after {took:?}; three attempts of 300 ms \
+             should take at least three timeouts"
+        );
     }
 }

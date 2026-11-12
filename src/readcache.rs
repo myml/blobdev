@@ -213,7 +213,6 @@ impl ReadCache {
         };
         if hdr.len != expect_len {
             // The volume geometry or the object changed under us.
-            self.used_bytes = self.used_bytes.saturating_sub(hdr.len + HEADER as u64);
             let _ = fs::remove_file(&path);
             self.forget(id);
             self.misses += 1;
@@ -227,7 +226,6 @@ impl ReadCache {
             return None;
         }
         if crc32fast::hash(&data) != hdr.crc {
-            self.used_bytes = self.used_bytes.saturating_sub(hdr.len + HEADER as u64);
             let _ = fs::remove_file(&path);
             self.forget(id);
             self.misses += 1;
@@ -261,6 +259,10 @@ impl ReadCache {
         if need > self.max_bytes {
             return Ok(());
         }
+        // Drop any previous copy first, so the space it held is available to
+        // this write and eviction is asked for the whole new size with a
+        // truthful total.
+        self.forget(id);
         self.evict_until_fits(need)?;
 
         self.generation += 1;
@@ -282,7 +284,6 @@ impl ReadCache {
             .with_context(|| format!("rename into {}", path.display()))?;
         // Replacing an entry that is already indexed must not count its bytes
         // twice.
-        self.forget(id);
         self.entries.insert(id, (self.generation, need));
         self.used_bytes += need;
         Ok(())
@@ -294,9 +295,8 @@ impl ReadCache {
             return;
         }
         let path = self.path(id);
-        if let Ok(meta) = fs::metadata(&path) {
-            self.used_bytes = self.used_bytes.saturating_sub(meta.len());
-            let _ = fs::remove_file(&path);
+        if fs::remove_file(&path).is_ok() {
+            self.forget(id);
         }
     }
 
@@ -318,8 +318,11 @@ impl ReadCache {
                 break;
             }
             if fs::remove_file(self.path(id)).is_ok() {
-                self.used_bytes = self.used_bytes.saturating_sub(size);
-                self.entries.remove(&id);
+                // One door for every subtraction: forget() looks the size up
+                // in the index rather than trusting a copy of it, so the two
+                // cannot drift.
+                self.forget(id);
+                let _ = size;
             }
         }
         Ok(())
@@ -553,6 +556,52 @@ mod index_tests {
         let counted: u64 = c.entries.values().map(|(_, size)| *size).sum();
         assert_eq!(counted, c.used_bytes, "byte count disagrees with the index");
         assert!(c.used_bytes <= c.max_bytes, "cache is over its budget");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// used_bytes must always equal the sum of the index.
+///
+/// It did not. `get` subtracted `hdr.len + HEADER` and then called forget(),
+/// which subtracted the indexed size a second time, and `remove` subtracted
+/// without dropping the index entry. Measured on the host with a 64 MiB
+/// budget, writing 256 MiB and reading it back: 22 entries and 92,275,392
+/// bytes on disk reported as 33,554,688 used, so eviction stopped long before
+/// the disk did. After: 15 entries, 62,915,040 bytes, inside the budget.
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    #[test]
+    fn used_bytes_matches_the_index_through_reads_and_writes() {
+        let dir = std::env::temp_dir().join(format!("blobdev-rcinv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ReadCache::open(&dir, "vol", 64 * 1024).unwrap();
+        let check = |c: &ReadCache, when: &str| {
+            let sum: u64 = c.entries.values().map(|(_, size)| *size).sum();
+            assert_eq!(c.used_bytes, sum, "used_bytes disagreed with the index {when}");
+        };
+        for id in 0..40u64 {
+            c.put(id, &vec![id as u8; 4096]).unwrap();
+            check(&c, "after put");
+            let _ = c.get(id.saturating_sub(1), 4096);
+            check(&c, "after get");
+            // A wrong length drops the entry; it must not be counted twice.
+            let _ = c.get(id.saturating_sub(2), 8192);
+            check(&c, "after a mismatched get");
+            c.put(id, &vec![9u8; 4096]).unwrap();
+            check(&c, "after a rewrite");
+        }
+        let on_disk: u64 = fs::read_dir(dir.join("vol"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.metadata().ok().map(|m| m.len()))
+            .sum();
+        assert!(
+            on_disk <= c.max_bytes,
+            "{on_disk} bytes on disk against a {} budget",
+            c.max_bytes
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

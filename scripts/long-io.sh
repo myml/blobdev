@@ -26,20 +26,38 @@ PID=$(pgrep -x blobdev | head -1)
 echo "minute  rss_kb  fds  dirty_mb"
 DURATION=${DURATION_SECONDS:-600}
 START=$(date +%s)
+IO_ERRORS=0
 while [ $(( $(date +%s) - START )) -lt "$DURATION" ]; do
   # Mixed: sequential write, random small write, read back.
-  dd if=/dev/urandom of=$MNT/seq.bin bs=1M count=8 conv=notrunc status=none 2>/dev/null
+  #
+  # Errors are counted, not discarded. A filesystem that has been shut down
+  # (the daemon died under it) stays listed in /proc/mounts, so the mount
+  # check passes while every write returns EIO -- and a soak that quietly
+  # does no IO measures nothing.
+  if ! dd if=/dev/urandom of=$MNT/seq.bin bs=1M count=8 conv=notrunc status=none 2>/dev/null; then
+    IO_ERRORS=$((IO_ERRORS + 1))
+  fi
   for _ in $(seq 1 20); do
-    dd if=/dev/urandom of=$MNT/rnd.bin bs=4096 seek=$((RANDOM % 2048)) count=1 conv=notrunc status=none 2>/dev/null
+    dd if=/dev/urandom of=$MNT/rnd.bin bs=4096 seek=$((RANDOM % 2048)) count=1 conv=notrunc status=none 2>/dev/null ||
+      IO_ERRORS=$((IO_ERRORS + 1))
   done
-  dd if=$MNT/seq.bin of=/dev/null bs=1M status=none 2>/dev/null
+  dd if=$MNT/seq.bin of=/dev/null bs=1M status=none 2>/dev/null || IO_ERRORS=$((IO_ERRORS + 1))
   sync
   M=$(( ($(date +%s) - START) / 60 ))
   RSS=$(awk '/VmRSS/{print $2}' /proc/$PID/status 2>/dev/null || echo 0)
   FDS=$(ls /proc/$PID/fd 2>/dev/null | wc -l)
   DIRTY=$(grep -oE "dirty [0-9]+" $W/l 2>/dev/null | tail -1 | awk '{print $2}' || echo "?")
   printf "%-7s %-7s %-4s %s\n" "$M" "$RSS" "$FDS" "${DIRTY:-0}"
+  # A single lost write is noise; a pass where every write failed means the
+  # filesystem is gone and the numbers from here on are meaningless.
+  if [ "$IO_ERRORS" -ge 21 ]; then
+    echo "  every write in this pass failed -- the filesystem is not accepting IO"
+    break
+  fi
 done
+echo "IO_ERRORS=$IO_ERRORS"
+[ "$IO_ERRORS" -ge 21 ] && echo "FAIL: the soak did no useful IO"
+
 echo "== verify"
 WANT=$(sha256sum $MNT/seq.bin | awk '{print $1}')
 umount $MNT

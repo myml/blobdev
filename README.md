@@ -228,6 +228,28 @@ cp bigfile /mnt/
 umount /mnt          # 触发 flush，所有脏 chunk 上传
 ```
 
+## 选项
+
+所有选项见 `blobdev --help`。挑影响面大的列在这里：
+
+| 选项 | 默认 | 作用 |
+|---|---|---|
+| `--meta PATH` | `./<volume>.meta` | 元数据文件。**始终用绝对路径**——相对路径会落在进程工作目录（systemd 下是 `/`） |
+| `--id N` | `-1`（自动） | 设备号。**服务部署必须固定**，否则重启后 `/dev/ublkbN` 会变 |
+| `--chunk-mib N` | 64 | 逻辑 chunk 大小，只在建卷时生效，之后由元数据决定 |
+| `--object-mib N` | 4 | 存储对象大小。**chunk 必须是它的整数倍**（如 64/4）。越小越省带宽、请求越多 |
+| `--cache-dir` / `--cache-size` | 无 / 64M | 磁盘读缓存，重启后仍命中。`0` 关闭 |
+| `--read-chunks N` | 64 | 内存里保留多少个对象 |
+| `--full-pct N` | 50 | 对象脏块达到 N% 就上传。**顺序大文件写到 100 避免重复上传** |
+| `--max-age S` | 30 | 脏超过 S 秒就上传 |
+| `--whole-chunk-pct N` | 25 | 一次读覆盖对象 N% 以上时，拉整个对象并缓存 |
+| `--retries N` | 4 | 瞬时错误的重试次数 |
+| `--timeout S` | 60 | 单请求超时，`0` 表示不限 |
+| `--queues N` / `--depth N` | 1 / 64 | ublk 队列数与每队列 tag 数 |
+| `--no-meta-replica` | 关 | 不把元数据副本存进对象存储 |
+| `--region` / `--path-style` / `--virtual-host-style` | `us-east-1` / 开 / — | S3 寻址 |
+| `--key-prefix P` | 空 | 对象键前缀，多卷共用 bucket 时用来分隔 |
+
 ## 运维
 
 systemd 单元与安装说明见 [`packaging/INSTALL.md`](packaging/INSTALL.md)：

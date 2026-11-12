@@ -67,7 +67,7 @@ options:
   --full-pct N       upload a chunk when N% of its blocks are dirty (default 50)
   --max-age S        upload a chunk dirty for S seconds (default 30)
   --read-chunks N    clean chunks kept in memory (default 64)
-  --whole-chunk-pct N  fetch a whole chunk for reads covering N% of it (default 25)
+  --whole-chunk-pct N  fetch the whole object for reads covering N% of it (default 25)
   --cache-dir PATH   keep clean chunks on local disk; enables read caching
   --cache-size SIZE  disk read cache budget, e.g. 20G (default 64M, 0 disables)
   --retries N        attempts per request on transient failures (default 4)

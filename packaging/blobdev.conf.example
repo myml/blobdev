@@ -6,6 +6,11 @@
 # The credentials below are visible to root only; protect the file with
 #   chown root:root /etc/blobdev/<volume>.conf && chmod 0600
 #
+# Always pass --meta with an absolute path. Without it the metadata lands in
+# the process's working directory -- which under systemd is / -- and the
+# service starts cleanly, so nothing tells you the volume is keeping its
+# identity somewhere you did not intend.
+#
 # Give each volume a fixed --id. With --id -1 the kernel hands out the lowest
 # free number, so after a restart the device can come back as /dev/ublkb1 when
 # it was /dev/ublkb0 -- and every mount unit pointing at the old name fails.

@@ -178,12 +178,23 @@ fn spawn_maintenance(
         // cache is doing its job, and how much has been sent.
         // Default ten minutes; BLOBDEV_SUMMARY_SECS overrides it, which is how
         // the periodic line is exercised in tests without a long run.
-        let summary_every = std::env::var("BLOBDEV_SUMMARY_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|s| *s > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(600));
+        // A bad value is said out loud. Silently falling back to ten minutes
+        // looks identical to the setting working, and the person who set it
+        // is watching for a line that will never come.
+        let summary_every = match std::env::var("BLOBDEV_SUMMARY_SECS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(n) if n > 0 => Duration::from_secs(n),
+                Ok(_) => {
+                    log::warn!("BLOBDEV_SUMMARY_SECS={v} is not a positive number; using 600");
+                    Duration::from_secs(600)
+                }
+                Err(_) => {
+                    log::warn!("BLOBDEV_SUMMARY_SECS={v} is not a number; using 600");
+                    Duration::from_secs(600)
+                }
+            },
+            Err(_) => Duration::from_secs(600),
+        };
         let mut last_summary = std::time::Instant::now();
         while !s.load(Ordering::SeqCst) {
             {

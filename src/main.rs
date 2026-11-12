@@ -335,6 +335,20 @@ fn open_meta(
 }
 
 fn warn_if_ephemeral(meta: &std::path::Path) {
+    // A relative path lands in whatever directory the process was started
+    // from. Under systemd that is `/`, so a config file that forgot --meta
+    // wrote /<volume>.meta, started cleanly, and left the operator thinking
+    // the metadata was somewhere it was not.
+    if meta.is_relative() {
+        log::warn!(
+            "metadata path {} is relative; it will be resolved against the \
+             current directory ({}). Pass --meta with an absolute path",
+            meta.display(),
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "?".to_string())
+        );
+    }
     let ephemeral = meta.starts_with("/tmp") || meta.starts_with("/run") || meta.starts_with("/dev/shm");
     if ephemeral {
         log::warn!(

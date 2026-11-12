@@ -90,6 +90,18 @@ expect_reject "create-size twice" "more than once" \
 expect_reject "id twice" "more than once" \
   "${base[@]}" --create-size 64M --id 3 --id 4
 
+echo "== environment"
+# A bad value used to fall back silently: BLOBDEV_SUMMARY_SECS=abc looked the
+# same as the setting working, and the person watching for the periodic line
+# waited for one that was never coming.
+BAD=$(BLOBDEV_SUMMARY_SECS=abc timeout 5 "$BIN" run --backend dir --dir "$W/env" \
+  --volume env$RANDOM --meta "$W/env.meta" --id -1 --create-size 64M 2>&1 | grep -c "BLOBDEV_SUMMARY_SECS=abc is not a number")
+if [ "$BAD" -ge 1 ]; then
+  echo "  ok   bad BLOBDEV_SUMMARY_SECS is reported"; PASS=$((PASS + 1))
+else
+  echo "  FAIL bad BLOBDEV_SUMMARY_SECS was ignored silently"; FAIL=$((FAIL + 1))
+fi
+
 echo "== required flags"
 expect_reject "no volume" "--volume is required" run --create-size 1G
 expect_reject "cache-size without cache-dir" "--cache-size needs --cache-dir" \

@@ -346,17 +346,14 @@ impl ReadCache {
         Ok(())
     }
 
-    /// Per-chunk sizes, for diagnostics and tests.
+    /// How many entries the cache holds.
+    ///
+    /// Read from the index rather than the directory: the index is what the
+    /// cache believes it has, and walking the directory counted files it does
+    /// not own -- the same confusion that once let a stray file fill the
+    /// cache. Reads are objects, not chunks.
     pub fn entry_count(&self) -> usize {
-        if !self.enabled {
-            return 0;
-        }
-        let Ok(rd) = fs::read_dir(&self.dir) else {
-            return 0;
-        };
-        rd.filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file() && !e.path().extension().is_some_and(|x| x == "tmp"))
-            .count()
+        self.entries.len()
     }
 
     /// Map of chunk id to size, for tests.

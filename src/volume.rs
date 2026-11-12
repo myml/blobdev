@@ -487,8 +487,9 @@ impl Volume {
         );
         if cache_bytes > 0 {
             log::info!(
-                "read cache: {} objects of {} MiB = up to {} MiB of memory",
+                "read cache: {} object{} of {} MiB = up to {} MiB of memory",
                 policy.read_chunks,
+                if policy.read_chunks == 1 { "" } else { "s" },
                 geometry.object_size.min(geometry.chunk_size) >> 20,
                 cache_bytes >> 20
             );
@@ -510,11 +511,16 @@ impl Volume {
                 match ReadCache::open(&d.dir, &layout.root, d.max_bytes) {
                     Ok(c) => {
                         log::info!(
-                            "read cache {}: {} of {} MiB used, {} chunks",
+                            // Entries are objects, not chunks: a chunk holds
+                            // 16 of them at the defaults, and calling them
+                            // chunks made a 60 MiB cache read as if it held
+                            // 60 MiB worth of 64 MiB units.
+                            "read cache {}: {} of {} MiB used, {} object{}",
                             d.dir.display(),
                             c.used_bytes() >> 20,
                             d.max_bytes >> 20,
-                            c.entry_count()
+                            c.entry_count(),
+                            if c.entry_count() == 1 { "" } else { "s" }
                         );
                         Some(c)
                     }

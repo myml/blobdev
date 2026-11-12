@@ -1348,8 +1348,14 @@ impl Volume {
         // that saves a doomed request per upload for the rest of the run.
         if self.data.caps().partial_write {
             // Objects are patched in place and named by chunk index, so there
-            // is nothing orphaned to reclaim.
-            return Ok(GcReport::default());
+            // is nothing orphaned to reclaim. Report how many are live all the
+            // same: a report of zero on a volume with ten objects reads as an
+            // empty volume, and an operator checking the wrong thing is worse
+            // than an operator told there is nothing to do.
+            return Ok(GcReport {
+                kept: self.uids.len() as u64,
+                ..GcReport::default()
+            });
         }
 
         let prefix = format!("{}/c/", self.layout.root);
@@ -1830,5 +1836,52 @@ mod tests {
         assert!(v.write(DEFAULT_CHUNK / BLOCK, 1, &blocks(1, 0)).is_err());
         let mut buf = vec![0u8; BLOCK as usize];
         assert!(v.read(DEFAULT_CHUNK / BLOCK, 1, &mut buf).is_err());
+    }
+}
+
+#[cfg(test)]
+mod gc_report_tests {
+    use super::*;
+    use crate::meta::FileMeta;
+    use crate::store::DirStore;
+    use std::sync::Arc;
+
+    /// A patch-style backend has nothing to reclaim, but it still has live
+    /// objects and must say so.
+    ///
+    /// Reporting zero on a volume holding a dozen objects reads as an empty
+    /// volume to whoever is looking at it during an incident.
+    #[test]
+    fn gc_reports_live_objects_even_when_nothing_can_be_reclaimed() {
+        let root = std::env::temp_dir().join(format!("blobdev-gcrep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let objects = root.join("objects");
+        let meta_path = root.join("meta");
+        let obj_blocks = DEFAULT_OBJECT / BLOCK;
+
+        let store = Arc::new(DirStore::new(&objects).unwrap());
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        for i in 0..3u64 {
+            v.write(i * obj_blocks + 1, 1, &[7u8; BLOCK as usize]).unwrap();
+        }
+        v.flush().unwrap();
+
+        let report = v.gc(true).unwrap();
+        assert!(
+            report.kept >= 3,
+            "gc reported {} live objects for a volume holding at least 3",
+            report.kept
+        );
+        assert_eq!(report.orphaned, 0, "nothing is orphaned here");
+        assert_eq!(report.deleted, 0, "a dry run deletes nothing");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

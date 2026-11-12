@@ -1385,3 +1385,60 @@ fn an_unchanged_save_does_not_reupload_the_copy() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A small read must fetch only what it asked for.
+///
+/// Range reads are the reason a 4 KiB block on S3 does not cost 4 MiB. The
+/// threshold above which the whole object is fetched is a deliberate
+/// tradeoff, but below it the fetch must be exactly the request.
+#[test]
+fn a_small_read_fetches_only_the_range_it_needs() {
+    let root = std::env::temp_dir().join(format!("blobdev-range-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let nblk = (16 * 1024 * 1024 / BLOCK) as usize;
+
+    {
+        // A directory store: range reads are cheap there, the same as on S3
+        // (S3 sets expensive_range_read = false too). WebDAV sets it true.
+        let store = Arc::new(DirStore::new(&objects).unwrap());
+        let mut v = Volume::open(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, nblk, &blocks(nblk, 0x77)).unwrap();
+        v.flush().unwrap();
+    }
+
+    let policy = Policy::default();
+    let object_size = 4 * 1024 * 1024u64;
+    let threshold = policy.whole_chunk_pct;
+
+    for kib in [4u64, 64, 512] {
+        let mut v = Volume::open(
+            Arc::new(DirStore::new(&objects).unwrap()),
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            None,
+            policy.clone(),
+        )
+        .unwrap();
+        let want = kib * 1024;
+        assert!(want * 100 < object_size * threshold, "{kib} KiB is above the threshold");
+        let plan = v.plan_read(0, (want / BLOCK) as usize).unwrap();
+        let req = plan.requests.first().expect("a cold read must fetch something");
+        assert_eq!(
+            req.len, want,
+            "a {kib} KiB read must fetch {want} bytes, not {}",
+            req.len
+        );
+        assert!(!req.whole, "a {kib} KiB read must not pull the whole object");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

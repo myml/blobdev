@@ -898,6 +898,7 @@ impl Volume {
         }
         // Otherwise treat it as sequential IO once the request covers this much
         // of the chunk; below that we save bandwidth at the cost of a miss.
+        //
         want.saturating_mul(100) >= chunk_len * self.policy.whole_chunk_pct
     }
 

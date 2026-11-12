@@ -6,6 +6,12 @@
 # The credentials below are visible to root only; protect the file with
 #   chown root:root /etc/blobdev/<volume>.conf && chmod 0600
 #
+# Give each volume a fixed --id. With --id -1 the kernel hands out the lowest
+# free number, so after a restart the device can come back as /dev/ublkb1 when
+# it was /dev/ublkb0 -- and every mount unit pointing at the old name fails.
+# One number per volume, never reused by another volume:
+#   --id 3   gives /dev/ublkb3, every time, including after a reboot.
+#
 # S3 example (path-style is required by RustFS and MinIO):
 BLOBDEV_ARGS="--backend s3 \
   --endpoint http://127.0.0.1:9000 \
@@ -14,6 +20,7 @@ BLOBDEV_ARGS="--backend s3 \
   --secret-key CHANGEME \
   --path-style \
   --volume data \
+  --id 3 \
   --meta /var/lib/blobdev/data.meta \
   --cache-dir /var/cache/blobdev \
   --cache-size 50G"

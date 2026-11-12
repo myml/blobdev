@@ -47,7 +47,13 @@ systemctl enable --now blobdev@data
 journalctl -u blobdev@data -f
 ```
 
-The device appears as `/dev/ublkbN`; the number is in the log.
+The device appears as `/dev/ublkbN`. **Do not read the number from the log**:
+with `--id -1` the kernel hands out the lowest free number, so the same volume
+can come back as `/dev/ublkb1` after a restart when it was `/dev/ublkb0` before,
+and anything mounted by name then fails.
+
+Give the volume a fixed id in its config (`--id 3` gives `/dev/ublkb3`, always)
+and mount by that name.
 
 ```bash
 mkfs.ext4 /dev/ublkbN

@@ -17,15 +17,20 @@ TimeoutStopSec=120
 Restart=on-failure
 RestartSec=5s
 
-# The process only needs its metadata file and cache directory, plus the
-# block-device node it creates.
+# Sandboxing has to leave the device machinery alone.
 #
-# ProtectSystem=strict makes everything outside ReadWritePaths read-only, so
-# --meta and --cache-dir must live under one of those paths. A volume whose
-# metadata is somewhere else needs that directory added here, or the daemon
-# will fail to write it and the volume will be unable to recover after a
-# restart.
-ProtectSystem=strict
+# ublk makes a character device under /sys/class/ublk-char and a block node
+# under /dev while the daemon runs. ProtectSystem=strict makes everything
+# outside ReadWritePaths read-only, and adding /dev and /sys to that list was
+# not enough -- the daemon logged a device, never got a node, and the service
+# started and stopped again within a second with nothing in the log to say
+# why. `full` protects /usr, /boot and /etc, which is what this wants, and
+# leaves /dev and /sys alone.
+#
+# --meta and --cache-dir still have to be under ReadWritePaths: ProtectSystem
+# makes everything else read-only, and a metadata file that cannot be written
+# is a volume that cannot recover after a restart.
+ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/blobdev /var/cache/blobdev

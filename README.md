@@ -50,8 +50,30 @@
 | 后端 | `partial_write` | 上传方式 | 单次 4 KiB 写的流量 |
 |---|---|---|---|
 | S3 | 否 | 整个 object 替换（4 MiB） | 最多 4 MiB（1024×） |
-| WebDAV | 是 | 只重写脏块区间 | 4 KiB（约 1×） |
+| WebDAV | **取决于服务端** | 支持 `Content-Range` 就只重写脏区间 | 4 KiB，服务端不支持时 4 MiB |
 | 本地目录 | 是 | 只重写脏块区间 | 4 KiB |
+
+**WebDAV 的“是”是声明的，不是保证的。** 它先乐观地按支持处理，第一次
+`Content-Range` PUT 失败后翻转为整对象写入，并在日志里说明。实测 Nextcloud
+**不支持**区间写入：
+
+```
+WARN patch <vol>/c/0 failed (partial write not supported by this WebDAV server)
+```
+
+代价是每个卷的第一次上传多一次完整往返，之后不再尝试。要确认你的服务端
+支持与否，看第一次上传后日志里有没有这条 WARN。
+
+支持与否的差距（同样是 100 次 4 KiB 随机写，应用只写了 0.39 MiB）：
+
+| 后端 | 存储收到 | 放大 |
+|---|---|---|
+| WebDAV，服务端支持区间写 | **2.40 MiB** | **6×** |
+| WebDAV，服务端不支持（Nextcloud） | 108 MiB | 277× |
+| S3 | 52 MiB | 133× |
+
+所以选 WebDAV 服务端时，**`Content-Range` 支持比什么都重要**——它决定了
+写放大是 6 倍还是 277 倍。
 
 “最多”是关键：连续的小写会被攒批，一次上传带走多个脏块。实测（RustFS，
 100 次 4 KiB 随机写落在一个 4 MiB object 内）：

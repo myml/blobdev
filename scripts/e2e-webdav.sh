@@ -5,7 +5,7 @@
 # block ranges get rewritten instead of whole chunks.
 set -u
 BIN=${BIN:-./target/release/blobdev}
-ROOT=${ROOT:-/tmp/blobdev-dav}
+ROOT=${ROOT:-/var/tmp/blobdev-dav}
 VOL=${VOL:-davvol}
 ENDPOINT=${ENDPOINT:-http://127.0.0.1:18080}
 DEV=""
@@ -34,10 +34,12 @@ start() {
 
 rm -rf "$ROOT"; # /tmp is often a tmpfs on test hosts. Filling it makes later runs fail in a
 # way that looks like a blobdev bug, so refuse to start without room.
-AVAIL_KB=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+SPACE_DIR=$(dirname "${W:-${ROOT:-/var/tmp}}")
+mkdir -p "$SPACE_DIR" 2>/dev/null
+AVAIL_KB=$(df -Pk "$SPACE_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
 if [ -n "${AVAIL_KB:-}" ] && [ "$AVAIL_KB" -lt $((1024 * 1024)) ]; then
-  echo "FAIL: less than 1 GiB free in /tmp" >&2
-  df -h /tmp >&2
+  echo "FAIL: less than 1 GiB free in $SPACE_DIR" >&2
+  df -h "$SPACE_DIR" >&2
   exit 1
 fi
 

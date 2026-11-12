@@ -17,10 +17,12 @@
 #
 # usage: NC_URL=http://127.0.0.1:18083 nextcloud-e2e.sh
 set +e
-AVAIL_KB=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+SPACE_DIR=$(dirname "${W:-${ROOT:-/var/tmp}}")
+mkdir -p "$SPACE_DIR" 2>/dev/null
+AVAIL_KB=$(df -Pk "$SPACE_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
 if [ -n "${AVAIL_KB:-}" ] && [ "$AVAIL_KB" -lt $((1024 * 1024)) ]; then
-  echo "FAIL: less than 1 GiB free in /tmp" >&2
-  df -h /tmp >&2
+  echo "FAIL: less than 1 GiB free in $SPACE_DIR" >&2
+  df -h "$SPACE_DIR" >&2
   exit 1
 fi
 BIN=${BIN:-/usr/local/bin/blobdev}
@@ -29,21 +31,24 @@ NC_USER=${NC_USER:-ncadmin}
 NC_PASS=${NC_PASS:-ncpass12345}
 NC="$NC_URL/remote.php/dav/files/$NC_USER/blobdev"
 pkill -9 -x blobdev; sleep 2; umount /mnt/nc 2>/dev/null
-rm -rf /tmp/ncr; mkdir -p /tmp/ncr
+# Disk, not /tmp: on the test host /tmp is a tmpfs shared with other work, and
+# a run needs a few hundred megabytes.
+W=${W:-/var/tmp/bd-nextcloud}
+rm -rf "$W"; mkdir -p "$W"
 V=ncr$RANDOM
 start() {
   local log=$1; shift
   $BIN run --backend webdav --endpoint "$NC" --user "$NC_USER" --password "$NC_PASS" \
-    --volume $V --meta /tmp/ncr/v.meta --id -1 "$@" > "/tmp/ncr/$log" 2>&1 &
+    --volume $V --meta $W/v.meta --id -1 "$@" > "$W/$log" 2>&1 &
   DEV=""
   for i in $(seq 1 80); do
-    DEV=$(grep -oE "/dev/ublkb[0-9]+" "/tmp/ncr/$log" | head -1)
+    DEV=$(grep -oE "/dev/ublkb[0-9]+" "$W/$log" | head -1)
     [ -n "$DEV" ] && [ -e "$DEV" ] && break
     sleep 0.5
   done
   [ -n "$DEV" ] && [ -e "$DEV" ]
 }
-start log1 --create-size 256M || { echo "FAIL: no device"; tail -5 /tmp/ncr/log1; exit 1; }
+start log1 --create-size 256M || { echo "FAIL: no device"; tail -5 $W/log1; exit 1; }
 echo "device=$DEV"
 mkdir -p /mnt/nc
 mkfs.ext4 -q -F $DEV || { echo "FAIL mkfs"; exit 1; }
@@ -58,7 +63,7 @@ pkill -TERM -x blobdev
 for i in $(seq 1 200); do pgrep -x blobdev >/dev/null || break; sleep 0.5; done
 pgrep -x blobdev >/dev/null && { echo "FAIL: daemon still running"; pkill -9 -x blobdev; exit 1; }
 echo "daemon exited"
-start log2 || { echo "FAIL: no device on restart"; tail -5 /tmp/ncr/log2; exit 1; }
+start log2 || { echo "FAIL: no device on restart"; tail -5 $W/log2; exit 1; }
 echo "restart device=$DEV"
 mount -o ro $DEV /mnt/nc || { echo "FAIL remount"; exit 1; }
 S2=$(sha256sum /mnt/nc/a.bin | awk '{print $1}')

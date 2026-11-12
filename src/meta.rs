@@ -376,6 +376,14 @@ pub struct MirroredMeta {
     local: FileMeta,
     remote: std::sync::Arc<dyn ObjectStore>,
     key: String,
+    /// A marker file that says the store copy is behind the local file.
+    ///
+    /// Kept on disk, not in memory: the process that discovers the stale copy
+    /// is usually not the one that will try to recover from it. The local file
+    /// is ahead and the copy is behind by an unknown amount, and recovering
+    /// from a stale copy is worse than not recovering -- it opens, it reads,
+    /// and it points at objects that have been replaced since.
+    marker: std::path::PathBuf,
 }
 
 impl MirroredMeta {
@@ -384,11 +392,25 @@ impl MirroredMeta {
         remote: std::sync::Arc<dyn ObjectStore>,
         key: String,
     ) -> MirroredMeta {
+        let marker = local.path().with_extension("meta-behind");
         MirroredMeta {
             local,
             remote,
             key,
+            marker,
         }
+    }
+
+    fn mark_stale(&self) {
+        let _ = std::fs::write(&self.marker, b"");
+    }
+
+    fn mark_fresh(&self) {
+        let _ = std::fs::remove_file(&self.marker);
+    }
+
+    fn is_stale(&self) -> bool {
+        self.marker.exists()
     }
 
     /// Where the copy is kept, for messages.
@@ -401,6 +423,14 @@ impl MetaStore for MirroredMeta {
     fn load(&self) -> Result<Option<Snapshot>> {
         if let Some(snap) = self.local.load()? {
             return Ok(Some(snap));
+        }
+        if self.is_stale() {
+            anyhow::bail!(
+                "local metadata is missing and the copy at {} is known to be \
+                 behind it (a save did not reach the store before this start). \
+                 Restoring from it could read the wrong objects",
+                self.key
+            );
         }
         // Ask whether the copy exists first: a plain get() reports a missing
         // object and an unreachable store the same way, and one of those is a
@@ -431,10 +461,28 @@ impl MetaStore for MirroredMeta {
     fn save(&mut self, snap: &Snapshot) -> Result<()> {
         self.local.save(snap)?;
         let bytes = snap.encode();
-        if let Err(e) = self.remote.put(&self.key, &bytes) {
-            // The local save already succeeded, so the volume is consistent;
-            // the copy is what protects against losing this disk.
-            log::warn!("could not update the metadata copy at {}: {e:#}", self.key);
+        match self.remote.put(&self.key, &bytes) {
+            Ok(_) => {
+                if self.is_stale() {
+                    log::info!("metadata copy at {} is up to date again", self.key);
+                    self.mark_fresh();
+                }
+            }
+            Err(e) => {
+                // The local save already succeeded, so the volume keeps
+                // working. The copy is now behind, and a recovery from it
+                // would open a volume that reads the wrong objects -- so it
+                // is marked untrustworthy on disk until a save gets through.
+                if !self.is_stale() {
+                    log::warn!(
+                        "could not update the metadata copy at {}: {e:#}; it is \
+                         now behind the local file and will not be used for \
+                         recovery until a save reaches the store again",
+                        self.key
+                    );
+                    self.mark_stale();
+                }
+            }
         }
         Ok(())
     }

@@ -1167,3 +1167,109 @@ fn the_volume_survives_losing_its_local_metadata() {
     assert_eq!(got, data, "data recovered through the copied metadata");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A save that reaches the local file but not the store must not leave a
+/// copy that recovery would trust.
+///
+/// The copy is written after the local file, so a store outage leaves it
+/// behind by an unknown amount. Recovering from it opens a volume that reads
+/// objects which have since been replaced -- worse than refusing, because it
+/// looks like it worked.
+#[test]
+fn a_copy_that_fell_behind_is_not_used_for_recovery() {
+    struct FlakyCopy {
+        inner: DirStore,
+        /// Refuse every put once set, as an unreachable store would.
+        broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl ObjectStore for FlakyCopy {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(blobdev::store::StoreError::transient("store is down"));
+            }
+            self.inner.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-behind-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let nblk = (4 * 1024 * 1024 / BLOCK) as usize;
+
+    {
+        // Data goes to a store that always works; only the metadata copy is
+        // pointed at one that can fail. A store outage takes out both, and
+        // then the volume cannot write at all -- which is a different test.
+        let store = Arc::new(FlakyCopy {
+            inner: DirStore::new(&objects).unwrap(),
+            broken: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let mut v = Volume::open(
+            store,
+            Box::new(MirroredMeta::new(
+                FileMeta::new(&meta_path),
+                Arc::new(FlakyCopy {
+                    inner: DirStore::new(&objects).unwrap(),
+                    broken: broken.clone(),
+                }),
+                "vol/meta".to_string(),
+            )),
+            Layout::new("vol"),
+            Some(Create::new(4 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, nblk, &blocks(nblk, 0x11)).unwrap();
+        v.flush().unwrap();
+
+        // The store goes away, then a write changes the layout: the local
+        // metadata now names a different object than the copy does.
+        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        v.write(nblk as u64, nblk, &blocks(nblk, 0x22)).unwrap();
+        v.flush().unwrap();
+    }
+    assert!(broken.load(std::sync::atomic::Ordering::SeqCst));
+    std::fs::remove_file(&meta_path).unwrap();
+
+    let store = Arc::new(FlakyCopy {
+        inner: DirStore::new(&objects).unwrap(),
+        broken: broken.clone(),
+    });
+    let err = Volume::open(
+        store,
+        Box::new(MirroredMeta::new(
+            FileMeta::new(&meta_path),
+            Arc::new(FlakyCopy {
+                inner: DirStore::new(&objects).unwrap(),
+                broken: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            "vol/meta".to_string(),
+        )),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .err()
+    .expect("recovery from a copy known to be behind must be refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("behind"),
+        "the refusal must say why, got: {msg}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

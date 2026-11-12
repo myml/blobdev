@@ -128,6 +128,14 @@ impl Target {
         let st = stop.clone();
         let device_fn = move |c: &UblkCtrl| {
             log::info!("created /dev/ublkb{}", c.dev_info().dev_id);
+            // A brand new block device is not something most people meet
+            // daily. One line says what to do with it, so the first run does
+            // not end with a device name and a trip to the README.
+            log::info!(
+                "  use it like any block device: mkfs.ext4 /dev/ublkb{0} && \
+                 mount /dev/ublkb{0} /mnt/point (mkfs only on a new volume)",
+                c.dev_info().dev_id
+            );
             let dev_id = c.dev_info().dev_id as i32;
             spawn_drain_watcher(s.volume.clone(), d, st, exit_after.clone(), dev_id);
         };

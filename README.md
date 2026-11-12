@@ -433,6 +433,10 @@ scripts/webdav_server.py DIR     # 本地 WebDAV 测试服务端（纯标准库�
    `blobdev run` 开同一个卷的第二个实例会被 `.lock` 挡住，换台机器就没有这层
    保护了——所以这一条是靠纪律而不是靠代码保证的。
 
+   `S3Store::create_object` / `replace_object`（`If-None-Match` / `If-Match`）
+   是给租约准备的，目前**没有任何调用方**，`caps().conditional_write` 也只剩
+   声明作用。别把它们当成多写者已经安全的证据。
+
 ## License
 
 Apache-2.0

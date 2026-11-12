@@ -1476,3 +1476,76 @@ fn every_remote_store_gets_a_metadata_copy() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A store that cannot range-read must still serve correct data.
+///
+/// Every backend declares `range_read: true` today, so the fallback that
+/// fetches the whole object and slices it locally has never run outside a
+/// hand test. A store that ignores Range headers -- or one bolted on later
+/// that cannot do them -- takes exactly that path, and it has to return the
+/// right bytes and only the bytes asked for.
+#[test]
+fn a_store_without_range_reads_still_returns_the_right_bytes() {
+    /// Accepts a range and ignores it, like a server that does not support
+    /// Range: the whole object comes back.
+    struct NoRange(DirStore);
+    impl ObjectStore for NoRange {
+        fn caps(&self) -> Caps {
+            Caps {
+                range_read: false,
+                ..Caps::S3
+            }
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.0.stat(key)
+        }
+        fn get(&self, key: &str, _range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.0.get(key, None)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.0.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-norange-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let nblk = (16 * 1024 * 1024 / BLOCK) as usize;
+    let mut data = vec![0u8; nblk * BLOCK as usize];
+    for b in 0..nblk {
+        data[b * BLOCK as usize..(b + 1) * BLOCK as usize].fill((b % 251) as u8);
+    }
+
+    {
+        let mut v = Volume::open(
+            Arc::new(NoRange(DirStore::new(&objects).unwrap())),
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, nblk, &data).unwrap();
+        v.flush().unwrap();
+    }
+    let mut v = Volume::open(
+        Arc::new(NoRange(DirStore::new(&objects).unwrap())),
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .unwrap();
+    // A block in the middle: it must come back exactly, not shifted or zeroed.
+    let blk = 3000u64;
+    let mut got = vec![0u8; BLOCK as usize];
+    v.read(blk, 1, &mut got).unwrap();
+    let want = &data[blk as usize * BLOCK as usize..(blk as usize + 1) * BLOCK as usize];
+    assert_eq!(got, want, "a store without ranged reads returned wrong data");
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -89,6 +89,8 @@ run_step_env() {
 
 echo "== load"
   run_step "concurrency 4 writers" /tmp/concurrent.sh 60 4
+  # Several volumes and the commands that manage them while they run.
+  run_step "multiple volumes" /tmp/multivolume.sh
   run_step_env "stress 2 min" \
     "ROOT=/root/bd-test/regress/stress SIZE=512M MB=64 SECONDS_TO_RUN=120" \
     "--backend dir --dir /root/bd-test/regress/objs" /tmp/stress.sh

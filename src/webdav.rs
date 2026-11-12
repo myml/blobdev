@@ -245,45 +245,66 @@ fn basic_auth(user: &str, password: &str) -> String {
 /// namespace prefix they like, so this ignores prefixes and only extracts the
 /// text.
 #[cfg_attr(not(test), allow(dead_code))]
-fn hrefs(body: &str) -> Vec<String> {
+/// Split a multistatus body into its `<response>` elements.
+///
+/// Servers namespace the prefix (`<d:response>`, `<D:response>`) or leave it
+/// off; splitting on the literal `<response` finds none of the former, which
+/// is what Nextcloud sends, and the listing comes back empty.
+fn split_responses(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(i) = rest.find("<href").or_else(|| rest.find("<D:href")).or_else(|| rest.find("<d:href")) {
-        let open = &rest[i..];
-        let Some(gt) = open.find('>') else { break };
-        let name = open[..gt]
-            .trim_start_matches('<')
-            .trim_end_matches('/')
-            .rsplit(':')
-            .next()
-            .unwrap_or("href")
-            .to_string();
-        let after = &rest[i + gt + 1..];
-        if let Some(value) = element_text(open, gt + 1, &name) {
-            if !value.is_empty() {
-                out.push(value);
+    let mut rest = text;
+    while let Some(i) = ["<d:response", "<D:response", "<response"]
+        .iter()
+        .filter_map(|tag| rest.find(tag).map(|p| (p, tag.len())))
+        .map(|(p, _)| p)
+        .min()
+    {
+        let after = &rest[i..];
+        let end = after.find("</d:response").or_else(|| after.find("</D:response")).or_else(|| after.find("</response"));
+        match end {
+            Some(e) => {
+                out.push(&after[..e]);
+                rest = &after[e..];
+            }
+            None => {
+                out.push(after);
+                break;
             }
         }
-        rest = after;
     }
     out
 }
 
-/// Text of the element named `name` whose content starts at byte `start`.
-///
-/// Prefixes (`D:`, `d:`, ...) are ignored, and a closing tag for anything
-/// other than this element (a sibling's `</D:propstat>`) is not mistaken for
-/// the end.
-fn element_text(body: &str, start: usize, name: &str) -> Option<String> {
-    let text = &body[start..];
-    let close = text.find("</")?;
-    let end = text[close..].find('>')? + close;
-    let tag = text[close + 2..end].trim();
-    if tag.rsplit(':').next().unwrap_or(tag) != name {
-        return None;
+/// The `href` of one `<response>` element.
+fn href_of(response: &str) -> Option<String> {
+    let body = response.split("</response").next().unwrap_or(response);
+    // The tag may be namespaced (`<d:href`, `<D:href`) or not (`<href`).
+    let (_, gt) = ["<href", "<d:href", "<D:href"]
+        .iter()
+        .filter_map(|tag| body.find(tag).map(|i| (i, tag.len())))
+        .filter_map(|(i, len)| Some((i, i + len + body[i + len..].find('>')?)))
+        .min_by_key(|(i, _)| *i)?;
+    let rest = &body[gt + 1..];
+    let end = rest.find('<')?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
     }
-    Some(xml_unescape(text[..close].trim()))
 }
+
+/// `getcontentlength` of one `<response>`, if the server reports it.
+fn length_of(response: &str) -> Option<u64> {
+    let lower = response.to_ascii_lowercase();
+    let key = lower.find("getcontentlength")?;
+    let after = &response[key..];
+    let gt = after.find('>')?;
+    let rest = &after[gt + 1..];
+    let end = rest.find('<')?;
+    rest[..end].trim().parse().ok()
+}
+
 
 fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<")
@@ -638,6 +659,63 @@ impl WebDavStore {
         }
     }
 
+    fn list_once(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut url = self.url_for(prefix.trim_end_matches('/'));
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+        let body = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><D:propfind xmlns:D=\"DAV:\"><D:prop><D:getcontentlength/><D:resourcetype/></D:prop></D:propfind>";
+        let reply = self.request("PROPFIND", &url, &[("Depth", "1")], Some(body))?;
+        if !matches!(reply.status, 207 | 200) {
+            return Err(reply.error(&format!("PROPFIND {url}")));
+        }
+        let text = String::from_utf8_lossy(&reply.body).to_string();
+        // hrefs are paths; `self.base` is a URL with scheme and authority.
+        // Stripping one from the other never matches, which leaves every key
+        // carrying the server's full path.
+        let base = self
+            .base
+            .trim_end_matches('/')
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string();
+        let mut out = Vec::new();
+        // Every <response> carries one href and its properties; pair them up
+        // rather than taking two independent lists, which would silently
+        // attach the wrong size to the wrong object.
+        for chunk in split_responses(&text) {
+            let Some(href) = href_of(chunk) else { continue };
+            let path = href
+                .strip_prefix(&base)
+                .unwrap_or(&href)
+                .trim_start_matches('/')
+                .to_string();
+            if path.is_empty() || path.ends_with('/') {
+                continue; // the collection itself
+            }
+            // Strip the configured prefix, if any, so keys match the ones
+            // `put` uses rather than the server's full path.
+            let configured = self.cfg.prefix.trim_matches('/');
+            let key = if configured.is_empty() {
+                path.trim_start_matches('/').to_string()
+            } else {
+                path.strip_prefix(configured)
+                    .unwrap_or(&path)
+                    .trim_start_matches('/')
+                    .to_string()
+            };
+            if key.is_empty() {
+                continue;
+            }
+            let len = length_of(chunk).unwrap_or(0);
+            out.push((key, len));
+        }
+        Ok(out)
+    }
+
     /// Ask for the size with a `PROPFIND` of depth 0.
     ///
     /// `getcontentlength` is the standard property; servers that omit it
@@ -856,6 +934,16 @@ impl ObjectStore for WebDavStore {
             .run(&format!("HEAD {key}"), || Ok(self.head(key)?.map(|(len, _)| len)))
     }
 
+    /// List the objects under a prefix with a depth-1 `PROPFIND`.
+    ///
+    /// The trait has a default that returns an empty list, which is honest for
+    /// a store that cannot enumerate but wrong here: `gc` reads the listing to
+    /// find objects no longer referenced, and an empty answer makes it refuse
+    /// to run rather than clean up. WebDAV can enumerate, so it does.
+    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.retry.run(&format!("PROPFIND {prefix}"), || self.list_once(prefix))
+    }
+
     fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Vec<u8>> {
         self.retry
             .run(&format!("GET {key}"), || self.fetch(key, range.clone()))
@@ -1017,11 +1105,14 @@ mod tests {
 </d:response><d:response>
 <d:href>/remote.php/dav/files/me/vol1/c%201</d:href>
 </d:response></d:multistatus>"#;
-        let h = hrefs(body);
-        assert_eq!(h.len(), 2);
+        let h: Vec<String> = split_responses(body)
+            .into_iter()
+            .filter_map(href_of)
+            .collect();
+        assert_eq!(h.len(), 2, "{h:?}");
         assert_eq!(h[1], "/remote.php/dav/files/me/vol1/c%201");
-        assert_eq!(hrefs("<D:href>a&amp;b</D:href>"), vec!["a&b".to_string()]);
-        assert!(hrefs("no hrefs here").is_empty());
+        // A body with no responses yields nothing rather than a bogus entry.
+        assert!(split_responses("no responses here").is_empty());
     }
 
     #[test]
@@ -1090,5 +1181,67 @@ mod head_fallback_tests {
                 "{status} must be reported rather than re-probed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/me/vol/</d:href>
+    <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/me/vol/c/u7</d:href>
+    <d:propstat><d:prop>
+      <d:getcontentlength>4194304</d:getcontentlength>
+      <d:resourcetype/>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/me/vol/c/63</d:href>
+    <d:propstat><d:prop>
+      <d:getcontentlength>1024</d:getcontentlength>
+      <d:resourcetype/>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+    /// A listing must pair each object with its own size.
+    ///
+    /// Taking hrefs and lengths as two independent lists would attach the
+    /// wrong size to the wrong object whenever the server omits one, which is
+    /// exactly the case for a collection entry.
+    #[test]
+    fn each_object_gets_its_own_size() {
+        let mut got = Vec::new();
+        for chunk in split_responses(SAMPLE) {
+            let Some(href) = href_of(chunk) else { continue };
+            if href.ends_with('/') {
+                continue;
+            }
+            let path = href
+                .strip_prefix("/remote.php/dav/files/me/vol")
+                .unwrap_or(&href)
+                .trim_start_matches('/');
+            got.push((path.to_string(), length_of(chunk).unwrap_or(0)));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("c/u7".to_string(), 4194304u64),
+                ("c/63".to_string(), 1024u64),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_response_without_a_length_still_yields_its_name() {
+        let chunk = "<d:href>/x/y</d:href><d:propstat></d:propstat>";
+        assert_eq!(href_of(chunk).as_deref(), Some("/x/y"));
+        assert_eq!(length_of(chunk), None);
     }
 }

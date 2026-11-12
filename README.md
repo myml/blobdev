@@ -83,6 +83,18 @@ WARN patch <vol>/c/0 failed (partial write not supported by this WebDAV server)
 | `--max-age 1` | 72 MiB | 42 | 185× |
 | `--max-age 30`（默认） | 52 MiB | 39 | **133×** |
 
+**顺序写会被上传两次**：默认 `--full-pct 50` 意味着一个 4 MiB object 写到 2 MiB
+时就上传，剩下的 2 MiB 再上传一次。实测顺序写 256 MiB（64 个 object）：
+
+```
+full-pct 50（默认）  → 101 次上传（1.58x）
+full-pct 90          → 仍是 2x（等不到 90% 就被 max-age 触发）
+full-pct 100         → 64 次上传（1.00x，写完才传）
+```
+
+顺序大文件写入想要零放大，用 `--full-pct 100`：整个 object 写满才上传。代价是
+内存里同时持有的脏块更多，崩溃时丢的也更多（这些块还没到存储）。
+
 **`--max-age` 不是决定性的**——`sync` / `fsync` 会发 FLUSH，而 FLUSH **立即上传
 所有待上传对象**，不看时间窗口。上表两次测量中间都有 `sync`，所以窗口设多大
 都差不多。真正决定放大的是**两次 FLUSH 之间写了多少**：

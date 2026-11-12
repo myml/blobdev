@@ -95,4 +95,40 @@ echo "== stop"
 systemctl stop "blobdev@$VOL"
 sleep 3
 [ "$(systemctl is-active "blobdev@$VOL")" = inactive ] && echo "  stopped cleanly"
+
+# Two configuration mistakes an operator can make, and what they look like.
+echo "== refuses a metadata path under /usr"
+BAD=sdcheckbad
+cat > "/etc/blobdev/$BAD.conf" <<CONF
+BLOBDEV_ARGS="--backend dir --dir /usr/local/share/blobdev-test/objs \
+  --volume $BAD --meta /usr/local/share/blobdev-test/$BAD.meta --id $((ID + 1)) --create-size 64M"
+CONF
+mkdir -p /usr/local/share/blobdev-test
+systemctl start "blobdev@$BAD" 2>/dev/null
+sleep 5
+if [ "$(systemctl is-active "blobdev@$BAD")" = active ]; then
+  echo "  FAIL: service ran with metadata under /usr"
+  systemctl stop "blobdev@$BAD" 2>/dev/null
+  exit 1
+fi
+echo "  refused: $(journalctl -u "blobdev@$BAD" --no-pager 2>/dev/null | grep -oE 'Read-only file system.*' | head -1)"
+rm -f "/etc/blobdev/$BAD.conf"
+rm -rf /usr/local/share/blobdev-test
+
+echo "== warns about metadata in /tmp"
+WARNTMP=sdchecktmp
+cat > "/etc/blobdev/$WARNTMP.conf" <<CONF
+BLOBDEV_ARGS="--backend dir --dir /var/lib/blobdev/objs2 \
+  --volume $WARNTMP --meta /tmp/$WARNTMP.meta --id $((ID + 2)) --create-size 64M"
+CONF
+systemctl start "blobdev@$WARNTMP" 2>/dev/null
+sleep 5
+if journalctl -u "blobdev@$WARNTMP" --no-pager 2>/dev/null | grep -q "does not survive a restart"; then
+  echo "  warned"
+else
+  echo "  NOTE: no warning seen (is the log level high enough?)"
+fi
+systemctl stop "blobdev@$WARNTMP" 2>/dev/null
+rm -f "/etc/blobdev/$WARNTMP.conf"
+
 echo "PASS: unit runs a volume and survives a restart"

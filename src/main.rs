@@ -214,6 +214,25 @@ fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
     }
 }
 
+/// Paths whose contents do not survive a restart.
+///
+/// Under systemd with PrivateTmp=true, /tmp is a private directory: a volume
+/// whose metadata lives there is fine until the service stops, and then the
+/// metadata is gone. Starting again with --create-size silently makes a new
+/// empty volume, which looks like the data was lost -- it was. A run from a
+/// shell is fine, so this warns rather than refuses.
+fn warn_if_ephemeral(meta: &std::path::Path) {
+    let ephemeral = meta.starts_with("/tmp") || meta.starts_with("/run") || meta.starts_with("/dev/shm");
+    if ephemeral {
+        log::warn!(
+            "metadata at {} is on a filesystem that does not survive a restart; \
+             the volume will be recreated empty when it stops. Put --meta under \
+             /var/lib/blobdev (or another persistent path)",
+            meta.display()
+        );
+    }
+}
+
 fn run(args: &[String]) -> Result<()> {
     let backend = arg(args, "--backend").unwrap_or_else(|| "dir".to_string());
     if !matches!(backend.as_str(), "dir" | "s3" | "webdav") {
@@ -244,6 +263,7 @@ fn run(args: &[String]) -> Result<()> {
     let meta_path = arg(args, "--meta")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{volume_name}.meta")));
+    warn_if_ephemeral(&meta_path);
     let policy = Policy {
         full_pct: arg(args, "--full-pct")
             .map(|s| s.parse())

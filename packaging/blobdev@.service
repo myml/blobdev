@@ -37,9 +37,22 @@ RestartSec=5s
 # why. `full` protects /usr, /boot and /etc, which is what this wants, and
 # leaves /dev and /sys alone.
 #
-# --meta and --cache-dir still have to be under ReadWritePaths: ProtectSystem
-# makes everything else read-only, and a metadata file that cannot be written
-# is a volume that cannot recover after a restart.
+# PrivateTmp gives the service its own /tmp, and that directory is thrown
+# away when the unit stops. A volume whose metadata lives in /tmp therefore
+# loses it and is recreated empty on the next start -- which looks exactly
+# like data loss, because it is. See the warning in the comment below.
+#
+# Where the volume may keep its files.
+#
+# ProtectSystem=full leaves everything outside /usr, /boot and /etc writable,
+# so --meta and --cache-dir work under /var/lib, /srv, /opt or /mnt without
+# being listed here. What fails is a path inside /usr, /boot or /etc: the
+# daemon reports "Read-only file system (os error 30)" and exits, which is a
+# clear enough failure. PrivateTmp makes /tmp a private directory -- put the
+# metadata somewhere it will still be after a restart.
+#
+# These two entries are here because they are where the example config puts
+# things, not because they are the only places that work.
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true

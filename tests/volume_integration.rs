@@ -1442,3 +1442,37 @@ fn a_small_read_fetches_only_the_range_it_needs() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Any store that outlives the machine gets a metadata copy.
+///
+/// The copy was gated on conditional_write, which is about optimistic
+/// locking. WebDAV has no portable conditional PUT, so WebDAV volumes got no
+/// copy and could not recover from losing their disk -- even though a copy
+/// only needs plain PUT and GET.
+#[test]
+fn every_remote_store_gets_a_metadata_copy() {
+    let root = std::env::temp_dir().join(format!("blobdev-copycaps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let dir = DirStore::new(&root).unwrap();
+    assert!(
+        !dir.has_metadata_copy(),
+        "a directory store is the machine; a copy there shares the disk"
+    );
+
+    // WebDAV without conditional writes: still a remote store.
+    let dav = blobdev::webdav::WebDavStore::new(blobdev::webdav::WebDavConfig::new(
+        "http://127.0.0.1:1/dav",
+    ))
+    .unwrap();
+    assert!(
+        !dav.caps().conditional_write,
+        "this test is about the store without conditional writes"
+    );
+    assert!(
+        dav.has_metadata_copy(),
+        "a WebDAV store outlives the machine and should keep a copy"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

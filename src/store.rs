@@ -70,11 +70,14 @@ pub type ETag = String;
 pub trait ObjectStore: Send + Sync {
     /// Whether this store can hold a second copy of a volume's metadata.
     ///
-    /// Only object stores: they outlive the machine. A directory store is the
-    /// machine, so a copy there would sit on the same disk that is going to
-    /// fail, which is the case the copy is for.
+    /// Any store that outlives the machine: a copy only needs plain PUT and
+    /// GET. This used to be gated on conditional_write, which is about
+    /// optimistic locking and has nothing to do with keeping a backup --
+    /// which left WebDAV volumes unable to recover from losing their disk,
+    /// for no reason. A directory store is the machine, so it gets no copy:
+    /// the copy would sit on the disk that is about to fail.
     fn has_metadata_copy(&self) -> bool {
-        self.caps().conditional_write
+        !matches!(self.name(), "directory" | "memory")
     }
 
     /// Capability declaration; the chunk layer adapts to it.

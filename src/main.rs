@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::sync::Arc;
 
-use blobdev::meta::{FileMeta, MetaStore};
+use blobdev::meta::{FileMeta, MetaStore, MirroredMeta};
 use blobdev::s3::{S3Config, S3Store};
 use blobdev::store::{DirStore, ObjectStore, Retry};
 use blobdev::webdav::{WebDavConfig, WebDavStore};
@@ -360,9 +360,23 @@ fn run(args: &[String]) -> Result<()> {
     let store = build_store(args)?;
     // Locked: two daemons on one volume would silently overwrite each other's
     // metadata. One-shot commands below deliberately do not lock.
+    //
+    // On an object store the metadata is also kept in the store, so losing
+    // this machine's disk does not lose the volume: the objects are still
+    // there, and without the copy nothing can name them. `--no-meta-replica`
+    // turns it off for a store whose visibility the operator does not trust.
+    let meta: Box<dyn MetaStore> = if store.has_metadata_copy() && !flag(args, "--no-meta-replica") {
+        Box::new(MirroredMeta::new(
+            FileMeta::locked(&meta_path)?,
+            build_store(args)?,
+            format!("{volume_name}/meta"),
+        ))
+    } else {
+        Box::new(FileMeta::locked(&meta_path)?)
+    };
     let volume = Volume::open_with_cache(
         store,
-        Box::new(FileMeta::locked(&meta_path)?),
+        meta,
         Layout::new(&volume_name),
         create,
         policy,

@@ -16,6 +16,7 @@
 //! snapshot is detected instead of trusted.
 
 use anyhow::{Context, Result};
+use crate::store::ObjectStore;
 use crc32fast::hash as crc32;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -356,6 +357,90 @@ impl MetaStore for FileMeta {
 
     fn name(&self) -> &str {
         "file"
+    }
+}
+
+/// Metadata on local disk, with a copy in the object store.
+///
+/// A volume's metadata lives next to the daemon, which is one disk away from
+/// being unrecoverable: if that disk dies, the objects are still in the store
+/// and nothing can name them. Measured before this existed -- deleting the
+/// metadata file left a volume that refused to open ("no metadata; pass a
+/// size to create it"), and taking that advice built an empty volume over
+/// data that was still there.
+///
+/// Saves go to both; loads prefer the local file and fall back to the store.
+/// The snapshot is a few hundred bytes, so the extra put is cheap, and it is
+/// written after the local one, so a store outage never loses a local save.
+pub struct MirroredMeta {
+    local: FileMeta,
+    remote: std::sync::Arc<dyn ObjectStore>,
+    key: String,
+}
+
+impl MirroredMeta {
+    pub fn new(
+        local: FileMeta,
+        remote: std::sync::Arc<dyn ObjectStore>,
+        key: String,
+    ) -> MirroredMeta {
+        MirroredMeta {
+            local,
+            remote,
+            key,
+        }
+    }
+
+    /// Where the copy is kept, for messages.
+    pub fn remote_key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl MetaStore for MirroredMeta {
+    fn load(&self) -> Result<Option<Snapshot>> {
+        if let Some(snap) = self.local.load()? {
+            return Ok(Some(snap));
+        }
+        // Ask whether the copy exists first: a plain get() reports a missing
+        // object and an unreachable store the same way, and one of those is a
+        // new volume while the other is an outage.
+        match self.remote.stat(&self.key) {
+            Ok(None) => Ok(None),
+            Ok(Some(_)) => {
+                let b = self
+                    .remote
+                    .get(&self.key, None)
+                    .with_context(|| format!("read the metadata copy at {}", self.key))?;
+                let snap = Snapshot::decode(&b).with_context(|| {
+                    format!("parse the metadata copy at {}", self.key)
+                })?;
+                log::warn!(
+                    "local metadata is missing; recovered it from {} ({} bytes). \
+                     The local file will be written again on the next save",
+                    self.key,
+                    b.len()
+                );
+                Ok(Some(snap))
+            }
+            Err(e) => Err(e)
+                .with_context(|| format!("look for the metadata copy at {}", self.key)),
+        }
+    }
+
+    fn save(&mut self, snap: &Snapshot) -> Result<()> {
+        self.local.save(snap)?;
+        let bytes = snap.encode();
+        if let Err(e) = self.remote.put(&self.key, &bytes) {
+            // The local save already succeeded, so the volume is consistent;
+            // the copy is what protects against losing this disk.
+            log::warn!("could not update the metadata copy at {}: {e:#}", self.key);
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "file+store"
     }
 }
 

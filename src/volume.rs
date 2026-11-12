@@ -431,8 +431,16 @@ impl Volume {
             Some(s) => s,
             None => {
                 let Some(create) = create else {
+                    // "pass a size to create it" is advice that builds an
+                    // empty volume on top of objects that are still in the
+                    // store. Say what is actually being asked.
                     anyhow::bail!(
-                        "volume {} has no metadata; pass a size to create it",
+                        "volume {} has no metadata. If the objects are still in \
+                         the store, recover rather than recreate: a store that \
+                         supports a metadata copy has one at {}/meta, and \
+                         `--no-meta-replica` turns that off. Passing a size \
+                         creates an empty volume and does not touch the objects",
+                        layout.root,
                         layout.root
                     );
                 };

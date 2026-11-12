@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use blobdev::meta::{ChunkState, FileMeta, Geometry, MetaStore, Snapshot};
+use blobdev::meta::{ChunkState, FileMeta, Geometry, MetaStore, MirroredMeta, Snapshot};
 use blobdev::store::{Caps, ObjectStore};
 use blobdev::store::{DirStore, MemStore};
 use blobdev::volume::{Create, Layout, Policy, Volume, BLOCK, DEFAULT_CHUNK};
@@ -1093,5 +1093,77 @@ fn a_read_larger_than_the_memory_cache_still_succeeds() {
     v.read(0, blocks, &mut got)
         .expect("a read spanning more objects than the memory cache holds must still work");
     assert_eq!(got, data, "the data came back wrong");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Losing the local metadata must not lose the volume, on a store that can
+/// hold a copy.
+///
+/// Measured before this existed: deleting the metadata file left a volume
+/// that refused to open, and the advice it gave -- "pass a size to create
+/// it" -- built an empty volume on top of data that was still in the store.
+#[test]
+fn the_volume_survives_losing_its_local_metadata() {
+    struct WholeObjects(DirStore);
+    impl ObjectStore for WholeObjects {
+        fn caps(&self) -> Caps {
+            // A store that replaces whole objects is the one worth keeping a
+            // metadata copy on: it outlives the machine.
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.0.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.0.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.0.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-metacopy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let blocks = (8 * 1024 * 1024 / BLOCK) as usize;
+    let mut data = vec![0u8; blocks * BLOCK as usize];
+    for b in 0..blocks {
+        data[b * BLOCK as usize..(b + 1) * BLOCK as usize].fill((b % 97) as u8);
+    }
+    let open = |create: Option<Create>| {
+        let store = Arc::new(WholeObjects(DirStore::new(&objects).unwrap()));
+        let meta = MirroredMeta::new(
+            FileMeta::new(&meta_path),
+            store.clone(),
+            "vol/meta".to_string(),
+        );
+        Volume::open(
+            store,
+            Box::new(meta),
+            Layout::new("vol"),
+            create,
+            Policy::default(),
+        )
+    };
+
+    {
+        let mut v = open(Some(Create::new(4 * DEFAULT_CHUNK))).unwrap();
+        v.write(0, blocks, &data).unwrap();
+        v.flush().unwrap();
+    }
+
+    // The disk holding the metadata is gone; the objects are still there.
+    std::fs::remove_file(&meta_path).unwrap();
+    assert!(!meta_path.exists());
+
+    let mut v = open(None).expect("the volume must open from the copy in the store");
+    let mut got = vec![0u8; data.len()];
+    v.read(0, blocks, &mut got).unwrap();
+    assert_eq!(got, data, "data recovered through the copied metadata");
     std::fs::remove_dir_all(&root).ok();
 }

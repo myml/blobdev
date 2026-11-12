@@ -68,6 +68,15 @@ pub type ETag = String;
 /// synchronous backend keeps the code simple; a backend that wants to overlap
 /// uploads does so internally with its own worker.
 pub trait ObjectStore: Send + Sync {
+    /// Whether this store can hold a second copy of a volume's metadata.
+    ///
+    /// Only object stores: they outlive the machine. A directory store is the
+    /// machine, so a copy there would sit on the same disk that is going to
+    /// fail, which is the case the copy is for.
+    fn has_metadata_copy(&self) -> bool {
+        self.caps().conditional_write
+    }
+
     /// Capability declaration; the chunk layer adapts to it.
     fn caps(&self) -> Caps;
 

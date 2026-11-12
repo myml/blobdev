@@ -87,9 +87,60 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 /// reads as "I changed the size and it kept the old one". Found while testing
 /// bad sizes: a base --create-size 64M made every invalid size below it look
 /// accepted, because the invalid one was never read.
+/// Every option the CLI understands.
+///
+/// Kept as one list rather than derived, because a flag that is read by a
+/// single subcommand has no central declaration to hang it on. The point is
+/// to refuse the ones that do not exist: an option nobody reads used to be
+/// ignored without a word, so `--cache-sise 128M` ran happily with the cache
+/// at its default and nothing said otherwise.
+const KNOWN_FLAGS: &[&str] = &[
+    "--access-key", "--backend", "--bucket", "--cache-dir", "--cache-size",
+    "--chunk-mib", "--create-size", "--depth", "--dir", "--dry-run",
+    "--endpoint", "--full-pct", "--help", "--id", "--key-prefix", "--max-age",
+    "--meta", "--no-meta-replica", "--object-mib", "--password", "--path-style",
+    "--queues", "--read-chunks", "--region", "--retries", "--secret-key",
+    "--timeout", "--user", "--verbose", "--virtual-host-style", "--volume",
+    "--whole-chunk-pct",
+];
+
+/// Edit distance, for "did you mean".
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// Refuse an option that is spelled twice or does not exist.
 fn reject_duplicates(args: &[String]) -> Result<()> {
     let mut seen: Vec<&str> = Vec::new();
     for a in args.iter().filter(|a| a.starts_with("--")) {
+        if !KNOWN_FLAGS.contains(&a.as_str()) {
+            let mut best: Option<(&str, usize)> = None;
+            for known in KNOWN_FLAGS {
+                let d = edit_distance(a, known);
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((known, d));
+                }
+            }
+            return Err(match best {
+                // Three edits is loose enough for a transposition and tight
+                // enough not to suggest something unrelated.
+                Some((guess, d)) if d <= 3 => anyhow::anyhow!(
+                    "unknown option {a}; did you mean {guess}?",
+                ),
+                _ => anyhow::anyhow!("unknown option {a}"),
+            });
+        }
         if seen.contains(&a.as_str()) {
             anyhow::bail!("{a} given more than once");
         }

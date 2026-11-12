@@ -69,6 +69,19 @@ expect_reject "full-pct 101" "0..=100" "${base[@]}" --create-size 64M --full-pct
 expect_reject "unknown backend" "unknown backend" \
   run --backend nope --volume x --create-size 1G
 
+echo "== unknown options"
+# An option nobody reads used to be ignored without a word: --cache-sise 128M
+# ran with the cache at its default. Every misspelling below had to be found
+# by reading the source.
+expect_reject "cache-sise" "did you mean --cache-size" \
+  "${base[@]}" --create-size 64M --cache-sise 128M
+expect_reject "volum" "did you mean --volume" \
+  "${base[@]}" --create-size 64M --volum x
+expect_reject "backnd" "did you mean --backend" \
+  "${base[@]}" --create-size 64M --backnd dir
+expect_reject "totally bogus" "unknown option --totally-bogus" \
+  "${base[@]}" --create-size 64M --totally-bogus x
+
 echo "== repeated flags"
 # `arg` takes the first match, so a duplicate used to be ignored silently --
 # and silently ignoring a --create-size is how a test of bad sizes passed.

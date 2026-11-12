@@ -36,7 +36,7 @@ fn usage() -> ! {
 }
 
 fn usage_text() -> String {
-    format!(
+    String::from(
         "usage:
   blobdev run --volume NAME --create-size SIZE [options]
   blobdev stop --id N

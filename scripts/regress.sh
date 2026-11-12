@@ -62,6 +62,7 @@ run_step "e2e nextcloud" /tmp/nextcloud-e2e.sh
   # Objects outlive the machine: recover without the metadata disk.
   run_step "recover from store" /tmp/recover.sh
   run_step "recover then write" /tmp/recover-then-write.sh
+  run_step "copy vs gc/ls/inspect" /tmp/meta-vs-gc.sh
 
 echo "== failure modes"
 run_step "outage handling" /tmp/outage.sh

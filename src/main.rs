@@ -259,6 +259,30 @@ fn build_store(args: &[String]) -> Result<Arc<dyn ObjectStore>> {
 /// metadata is gone. Starting again with --create-size silently makes a new
 /// empty volume, which looks like the data was lost -- it was. A run from a
 /// shell is fine, so this warns rather than refuses.
+/// The metadata for a one-shot command.
+///
+/// These read the same source the daemon writes, so a command run after the
+/// local file is gone can still answer -- which is exactly when `inspect` is
+/// worth having: "are the objects still there, and does anything point at
+/// them". Reporting "no metadata" while the copy sits in the store answers
+/// neither.
+fn open_meta(
+    args: &[String],
+    volume_name: &str,
+    meta_path: &std::path::Path,
+) -> Result<Box<dyn MetaStore>> {
+    let store = build_store(args)?;
+    if store.has_metadata_copy() && !flag(args, "--no-meta-replica") {
+        let remote = build_store(args)?;
+        return Ok(Box::new(MirroredMeta::new(
+            FileMeta::new(meta_path),
+            remote,
+            format!("{volume_name}/meta"),
+        )));
+    }
+    Ok(Box::new(FileMeta::new(meta_path)))
+}
+
 fn warn_if_ephemeral(meta: &std::path::Path) {
     let ephemeral = meta.starts_with("/tmp") || meta.starts_with("/run") || meta.starts_with("/dev/shm");
     if ephemeral {
@@ -456,10 +480,11 @@ fn inspect(args: &[String]) -> Result<()> {
     let meta_path = arg(args, "--meta")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{volume_name}.meta")));
-    let snap = match blobdev::meta::FileMeta::new(&meta_path).load()? {
+    let meta = open_meta(args, &volume_name, &meta_path)?;
+    let snap = match meta.load()? {
         Some(s) => s,
         None => {
-            println!("no metadata at {}", meta_path.display());
+            println!("no metadata at {}, and no copy in the store", meta_path.display());
             return Ok(());
         }
     };
@@ -542,9 +567,10 @@ fn gc(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(format!("{volume_name}.meta")));
     let dry_run = flag(args, "--dry-run");
     let store = build_store(args)?;
+    let meta = open_meta(args, &volume_name, &meta_path)?;
     let mut volume = Volume::open(
         store,
-        Box::new(FileMeta::new(&meta_path)),
+        meta,
         Layout::new(&volume_name),
         None,
         Policy::default(),

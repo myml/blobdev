@@ -1295,3 +1295,93 @@ fn a_copy_that_fell_behind_is_not_used_for_recovery() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A save that changes nothing must not reach the store again.
+///
+/// The metadata is saved on every upload and grows with the object count, so
+/// re-sending an identical snapshot is pure cost during repeated writes.
+#[test]
+fn an_unchanged_save_does_not_reupload_the_copy() {
+    struct Counting {
+        inner: DirStore,
+        puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ObjectStore for Counting {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            if key.ends_with("/meta") {
+                self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-dedup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let puts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut meta = MirroredMeta::new(
+        FileMeta::new(root.join("meta")),
+        Arc::new(Counting {
+            inner: DirStore::new(&objects).unwrap(),
+            puts: puts.clone(),
+        }),
+        "vol/meta".to_string(),
+    );
+
+    let geom = Geometry {
+        chunk_size: DEFAULT_CHUNK,
+        object_size: 4 << 20,
+        size: 4 * DEFAULT_CHUNK,
+    };
+    let mut snap = Snapshot::new(geom);
+    snap.chunks.insert(
+        0,
+        ChunkState {
+            dirty: Default::default(),
+            uploaded: true,
+            uid: 7,
+        },
+    );
+    meta.save(&snap).unwrap();
+    let after_first = puts.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(after_first, 1, "the first save must reach the store");
+
+    for _ in 0..5 {
+        meta.save(&snap).unwrap();
+    }
+    assert_eq!(
+        puts.load(std::sync::atomic::Ordering::SeqCst),
+        after_first,
+        "identical saves must not be sent again"
+    );
+
+    // A real change still goes out.
+    snap.chunks.insert(
+        1,
+        ChunkState {
+            dirty: Default::default(),
+            uploaded: true,
+            uid: 9,
+        },
+    );
+    meta.save(&snap).unwrap();
+    assert_eq!(
+        puts.load(std::sync::atomic::Ordering::SeqCst),
+        after_first + 1,
+        "a changed snapshot must be sent"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

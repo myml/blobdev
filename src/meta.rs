@@ -391,6 +391,15 @@ pub struct MirroredMeta {
     local: FileMeta,
     remote: std::sync::Arc<dyn ObjectStore>,
     key: String,
+    /// What was last written to the store, to skip identical saves.
+    ///
+    /// The metadata grows with the number of written objects -- about 20
+    /// bytes each, so a full 10 TiB volume is around 50 MiB -- and every
+    /// upload saves it. Uploads that do not change the layout (writing the
+    /// same block again, a chunk that was already committed) would otherwise
+    /// send that whole thing each time.
+    last_sent: Option<Vec<u8>>,
+
     /// A marker file that says the store copy is behind the local file.
     ///
     /// Kept on disk, not in memory: the process that discovers the stale copy
@@ -412,6 +421,7 @@ impl MirroredMeta {
             local,
             remote,
             key,
+            last_sent: None,
             marker,
         }
     }
@@ -492,8 +502,13 @@ impl MetaStore for MirroredMeta {
     fn save(&mut self, snap: &Snapshot) -> Result<()> {
         self.local.save(snap)?;
         let bytes = snap.encode();
+        if self.last_sent.as_deref() == Some(bytes.as_slice()) && !self.is_stale() {
+            // Nothing changed and the copy is known to be current.
+            return Ok(());
+        }
         match self.remote.put(&self.key, &bytes) {
             Ok(_) => {
+                self.last_sent = Some(bytes);
                 if self.is_stale() {
                     log::info!("metadata copy at {} is up to date again", self.key);
                     self.mark_fresh();

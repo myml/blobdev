@@ -18,9 +18,19 @@ $BIN reap >/dev/null 2>&1
 rm -rf $W; mkdir -p $W $MNT
 $BIN run "${S3[@]}" --volume long$RANDOM --meta $W/v.meta --id 73 --create-size 1G \
   --max-age 5 --full-pct 30 > $W/l 2>&1 &
-for _ in $(seq 1 180); do [ -e /dev/ublkb73 ] && break; sleep 1; done
-mkfs.ext4 -q -F /dev/ublkb73 2>/dev/null
-for _ in $(seq 1 120); do mount /dev/ublkb73 $MNT 2>/dev/null && break; sleep 1; done
+# Wait for THIS daemon, not for a device to exist: a device left by an
+# earlier run is still there, is shut down, and mounting it produces a
+# filesystem that returns EIO to everything.
+for _ in $(seq 1 180); do grep -q "created /dev/ublkb73" $W/l 2>/dev/null && break; sleep 1; done
+if ! pgrep -x blobdev >/dev/null || ! grep -q "created /dev/ublkb73" $W/l 2>/dev/null; then
+  echo "FAIL: the daemon did not start"
+  grep -vE "^\[.*INFO" $W/l 2>/dev/null | head -3
+  exit 1
+fi
+mkfs.ext4 -q -F /dev/ublkb73 2>/dev/null || { echo "FAIL: mkfs"; exit 1; }
+mounted=no
+for _ in $(seq 1 120); do mount /dev/ublkb73 $MNT 2>/dev/null && { mounted=yes; break; }; sleep 1; done
+[ "$mounted" = yes ] || { echo "FAIL: mount"; exit 1; }
 PID=$(pgrep -x blobdev | head -1)
 
 echo "minute  rss_kb  fds  dirty_mb"

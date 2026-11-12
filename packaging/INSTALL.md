@@ -17,6 +17,16 @@ To load it at boot:
 echo ublk_drv > /etc/modules-load.d/blobdev.conf
 ```
 
+The systemd unit loads it too (`ExecStartPre=-/sbin/modprobe ublk_drv`) and
+waits for `systemd-modules-load.service`, so a machine where nobody ran the
+command above still works. If it is missing and cannot be loaded, the daemon
+says so instead of blaming a leftover device:
+
+```
+failed to create ublk device id=7: OtherError(-2)
+hint: the ublk driver is not loaded. Load it with `modprobe ublk_drv`, ...
+```
+
 ## Build and install
 
 ```bash

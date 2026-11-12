@@ -76,10 +76,9 @@ impl Target {
             .build()
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "failed to create ublk device id={}: {e:?}\n\
-                     hint: a leftover /dev/ublkb*/ublkc* may still be in use; \
-                     check `ls /sys/class/ublk-char` and stop it with `blobdev stop --id N`",
-                    self.id
+                    "failed to create ublk device id={}: {e:?}\n{}",
+                    self.id,
+                    ublk_hint()
                 )
             })?;
 
@@ -200,6 +199,26 @@ fn spawn_maintenance(
         stop,
         handle: Some(handle),
     }
+}
+
+/// What to check when the kernel refuses to make a ublk device.
+///
+/// The kernel says the same thing whether the driver is missing or a device
+/// id is still held, and guessing wrong sends an operator looking at leftover
+/// devices when the real problem is that `ublk_drv` was never loaded -- which
+/// is what happens at boot on a machine where nothing loads it. Say which it
+/// is.
+fn ublk_hint() -> String {
+    let have_driver = std::path::Path::new("/sys/module/ublk_drv").exists();
+    if !have_driver {
+        return "hint: the ublk driver is not loaded. Load it with `modprobe ublk_drv`, \n\
+                and make it permanent so a reboot does not lose the volume: \n\
+                echo ublk_drv > /etc/modules-load.d/ublk.conf"
+            .to_string();
+    }
+    "hint: a leftover /dev/ublkb*/ublkc* may still be in use; check \n\
+     `ls /sys/class/ublk-char` and stop it with `blobdev stop --id N`"
+        .to_string()
 }
 
 /// React to SIGINT/SIGTERM by flushing, not by tearing the device down: a

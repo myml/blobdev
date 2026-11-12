@@ -42,7 +42,15 @@ CONF
 chmod 0600 "/etc/blobdev/$VOL.conf"
 systemctl daemon-reload
 
-echo "== start"
+# Start from the state a reboot leaves: the driver module is not loaded and
+# nothing has run modprobe. The unit has to cope, or every boot needs a human.
+echo "== start with ublk_drv unloaded (what a reboot looks like)"
+modprobe -r ublk_drv 2>/dev/null
+if [ -d /sys/module/ublk_drv ]; then
+  echo "  note: could not unload ublk_drv (in use); continuing"
+else
+  echo "  driver unloaded"
+fi
 systemctl start "blobdev@$VOL" || { echo "FAIL: systemctl start"; exit 1; }
 sleep 6
 [ "$(systemctl is-active "blobdev@$VOL")" = active ] || {
@@ -51,7 +59,14 @@ sleep 6
   exit 1
 }
 DEV=/dev/ublkb$ID
-[ -e "$DEV" ] || { echo "FAIL: $DEV was not created"; exit 1; }
+[ -e "$DEV" ] || {
+  echo "FAIL: $DEV was not created"
+  journalctl -u "blobdev@$VOL" --no-pager 2>/dev/null | tail -5
+  exit 1
+}
+if [ -d /sys/module/ublk_drv ]; then
+  echo "  driver loaded by the unit"
+fi
 echo "  device=$DEV active=yes"
 
 echo "== use it"

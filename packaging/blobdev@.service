@@ -3,9 +3,19 @@ Description=blobdev %i: object storage as a block device
 Documentation=https://github.com/myml/blobdev
 After=network-online.target
 Wants=network-online.target
+# ublk_drv is a module on most kernels. Without this the service starts at
+# boot before anything has loaded it, fails to create its device, and exits --
+# well, it fails; the error used to blame a leftover device, which sent the
+# reader somewhere else entirely.
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
 
 [Service]
 Type=simple
+# Loading the module here as well means the unit works on a machine where
+# nobody has written /etc/modules-load.d/ublk.conf. modprobe is a no-op when
+# it is already loaded.
+ExecStartPre=-/sbin/modprobe ublk_drv
 # The volume name selects /etc/blobdev/<volume>.conf for its settings.
 EnvironmentFile=/etc/blobdev/%i.conf
 ExecStart=/usr/local/bin/blobdev run $BLOBDEV_ARGS
@@ -36,9 +46,11 @@ PrivateTmp=true
 ReadWritePaths=/var/lib/blobdev /var/cache/blobdev
 NoNewPrivileges=true
 
-# ublk needs CAP_SYS_ADMIN to create the device.
-CapabilityBoundingSet=CAP_SYS_ADMIN
-AmbientCapabilities=CAP_SYS_ADMIN
+# CAP_SYS_ADMIN creates the ublk device; CAP_SYS_MODULE lets the ExecStartPre
+# above load the driver. modprobe fails with "Operation not permitted" without
+# it, and the service then starts without a device.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_MODULE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_MODULE
 
 [Install]
 WantedBy=multi-user.target

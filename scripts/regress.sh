@@ -61,6 +61,7 @@ run_step "e2e webdav (simple server)" /tmp/e2e-webdav.sh
 run_step "e2e nextcloud" /tmp/nextcloud-e2e.sh
   # Objects outlive the machine: recover without the metadata disk.
   run_step "recover from store" /tmp/recover.sh
+  run_step "recover then write" /tmp/recover-then-write.sh
 
 echo "== failure modes"
 run_step "outage handling" /tmp/outage.sh

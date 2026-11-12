@@ -323,6 +323,21 @@ impl FileMeta {
         })
     }
 
+    /// Write the snapshot without needing `&mut`, so a read path can repair
+    /// a missing file. Same temp-file, fsync, rename sequence as `save`.
+    pub fn save_atomic(&self, snap: &Snapshot) -> Result<()> {
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, snap.encode())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        {
+            let f = std::fs::File::open(&tmp)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename into {}", self.path.display()))?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -445,9 +460,25 @@ impl MetaStore for MirroredMeta {
                 let snap = Snapshot::decode(&b).with_context(|| {
                     format!("parse the metadata copy at {}", self.key)
                 })?;
+                // Write it back now. Saving only happens on an upload, so a
+                // volume that is recovered and then read from would keep
+                // depending on the store at every start -- and would fail to
+                // open at all the next time the store was unreachable.
+                if let Err(e) = self.local.save_atomic(&snap) {
+                    log::warn!(
+                        "recovered the metadata from {} but could not write it \
+                         back to the local file ({e:#}); the next start will \
+                         need the store again",
+                        self.key
+                    );
+                } else {
+                    // The copy in the store is what was just read, so it is
+                    // current; any marker saying otherwise is out of date.
+                    self.mark_fresh();
+                }
                 log::warn!(
-                    "local metadata is missing; recovered it from {} ({} bytes). \
-                     The local file will be written again on the next save",
+                    "local metadata was missing; recovered it from {} ({} bytes) \
+                     and wrote it back",
                     self.key,
                     b.len()
                 );

@@ -1165,6 +1165,28 @@ fn the_volume_survives_losing_its_local_metadata() {
     let mut got = vec![0u8; data.len()];
     v.read(0, blocks, &mut got).unwrap();
     assert_eq!(got, data, "data recovered through the copied metadata");
+
+    // The local file must be back: saving only happens on an upload, so a
+    // volume that was recovered and then only read from would depend on the
+    // store at every start and fail to open when it was unreachable.
+    assert!(
+        meta_path.exists(),
+        "recovery must write the metadata back to the local file"
+    );
+
+    // A second open must not need the store at all.
+    let err = Volume::open(
+        Arc::new(WholeObjects(DirStore::new(&root.join("gone")).unwrap())),
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        Policy::default(),
+    )
+    .err();
+    assert!(
+        err.is_none(),
+        "with the local file back, opening must not consult the store: {err:?}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

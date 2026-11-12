@@ -19,7 +19,7 @@
 //! mid-write cannot leave a half-written chunk visible.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -67,6 +67,15 @@ pub struct ReadCache {
     hits: u64,
     misses: u64,
     enabled: bool,
+    /// Every entry on disk: id -> (generation, bytes).
+    ///
+    /// Eviction needs the least recently used entries. It used to get them by
+    /// reading the whole directory and the header of every file, which at
+    /// --cache-size 16G is 4096 files and measured 59 ms -- spent in `put`,
+    /// under the volume lock, every time the cache was full. The index is
+    /// built once at open and kept current on put/get/evict, so eviction is a
+    /// sort over memory.
+    entries: HashMap<u64, (u64, u64)>,
 }
 
 impl ReadCache {
@@ -86,6 +95,7 @@ impl ReadCache {
             hits: 0,
             misses: 0,
             enabled,
+            entries: HashMap::new(),
         };
         if enabled {
             fs::create_dir_all(&c.dir)
@@ -99,6 +109,7 @@ impl ReadCache {
     fn rescan(&mut self) -> Result<()> {
         self.used_bytes = 0;
         self.generation = 0;
+        self.entries.clear();
         let entries = match fs::read_dir(&self.dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -117,16 +128,30 @@ impl ReadCache {
                 continue;
             }
             self.used_bytes += meta.len();
+            let Ok(id) = entry.file_name().to_string_lossy().parse::<u64>() else {
+                continue;
+            };
+            let mut gen = 0;
             if let Ok(mut f) = fs::File::open(&path) {
                 let mut h = [0u8; HEADER];
                 if f.read_exact(&mut h).is_ok() {
                     if let Some(hdr) = EntryHeader::decode(&h) {
+                        gen = hdr.generation;
                         self.generation = self.generation.max(hdr.generation);
                     }
                 }
             }
+            self.entries.insert(id, (gen, meta.len()));
         }
         Ok(())
+    }
+
+    /// Drop an entry from the index and from the byte count, after its file
+    /// has been removed.
+    fn forget(&mut self, id: u64) {
+        if let Some((_, size)) = self.entries.remove(&id) {
+            self.used_bytes = self.used_bytes.saturating_sub(size);
+        }
     }
 
     fn path(&self, id: u64) -> PathBuf {
@@ -169,11 +194,13 @@ impl ReadCache {
         let mut h = [0u8; HEADER];
         if f.read_exact(&mut h).is_err() {
             let _ = fs::remove_file(&path);
+            self.forget(id);
             self.misses += 1;
             return None;
         }
         let Some(hdr) = EntryHeader::decode(&h) else {
             let _ = fs::remove_file(&path);
+            self.forget(id);
             self.misses += 1;
             return None;
         };
@@ -181,18 +208,21 @@ impl ReadCache {
             // The volume geometry or the object changed under us.
             self.used_bytes = self.used_bytes.saturating_sub(hdr.len + HEADER as u64);
             let _ = fs::remove_file(&path);
+            self.forget(id);
             self.misses += 1;
             return None;
         }
         let mut data = vec![0u8; hdr.len as usize];
         if f.read_exact(&mut data).is_err() {
             let _ = fs::remove_file(&path);
+            self.forget(id);
             self.misses += 1;
             return None;
         }
         if crc32fast::hash(&data) != hdr.crc {
             self.used_bytes = self.used_bytes.saturating_sub(hdr.len + HEADER as u64);
             let _ = fs::remove_file(&path);
+            self.forget(id);
             self.misses += 1;
             return None;
         }
@@ -205,6 +235,9 @@ impl ReadCache {
         if let Ok(mut wf) = fs::OpenOptions::new().write(true).open(&path) {
             let _ = wf.seek(SeekFrom::Start(0));
             let _ = wf.write_all(&refreshed.encode());
+        }
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.0 = self.generation;
         }
         self.hits += 1;
         Some(data)
@@ -240,6 +273,10 @@ impl ReadCache {
         }
         fs::rename(&tmp, &path)
             .with_context(|| format!("rename into {}", path.display()))?;
+        // Replacing an entry that is already indexed must not count its bytes
+        // twice.
+        self.forget(id);
+        self.entries.insert(id, (self.generation, need));
         self.used_bytes += need;
         Ok(())
     }
@@ -261,37 +298,21 @@ impl ReadCache {
         if self.used_bytes + need <= self.max_bytes {
             return Ok(());
         }
-        // Rank entries by generation (their last-access counter).
-        let mut entries: Vec<(u64, u64, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "tmp") {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            let mut gen = 0u64;
-            if let Ok(mut f) = fs::File::open(&path) {
-                let mut h = [0u8; HEADER];
-                if f.read_exact(&mut h).is_ok() {
-                    if let Some(hdr) = EntryHeader::decode(&h) {
-                        gen = hdr.generation;
-                    }
-                }
-            }
-            let size = meta.len();
-            entries.push((gen, size, path));
-        }
-        entries.sort_by_key(|(g, _, _)| *g);
-        for (_, size, path) in entries {
+        // Least recently used first. The index is in memory, so this is a
+        // sort over a few thousand pairs rather than a directory walk.
+        let mut order: Vec<(u64, u64, u64)> = self
+            .entries
+            .iter()
+            .map(|(id, (gen, size))| (*gen, *id, *size))
+            .collect();
+        order.sort_unstable_by_key(|(gen, _, _)| *gen);
+        for (_, id, size) in order {
             if self.used_bytes + need <= self.max_bytes {
                 break;
             }
-            if fs::remove_file(&path).is_ok() {
+            if fs::remove_file(self.path(id)).is_ok() {
                 self.used_bytes = self.used_bytes.saturating_sub(size);
+                self.entries.remove(&id);
             }
         }
         Ok(())
@@ -459,5 +480,46 @@ mod tests {
         assert_eq!(c.entry_count(), 0);
         assert_eq!(c.used_bytes(), 0);
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    /// The index must match what is on disk after eviction.
+    ///
+    /// Eviction used to walk the directory every time; it now sorts an
+    /// in-memory index, so the index has to be right or entries leak and the
+    /// byte count drifts.
+    #[test]
+    fn eviction_keeps_the_index_and_the_disk_in_step() {
+        let dir = std::env::temp_dir().join(format!("blobdev-rcidx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Room for five 4 KiB entries.
+        let mut c = ReadCache::open(&dir, "vol", 5 * (4096 + HEADER as u64)).unwrap();
+        for id in 0..20u64 {
+            c.put(id, &vec![id as u8; 4096]).unwrap();
+            // Touch the lower ids so the higher ones are least recent.
+            if id >= 4 {
+                let _ = c.get(id - 4, 4096);
+            }
+        }
+        let on_disk: Vec<u64> = fs::read_dir(c.dir.clone())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_string_lossy().parse::<u64>().ok())
+            .collect();
+        assert_eq!(
+            on_disk.len(),
+            c.entries.len(),
+            "index has {} entries, disk has {}",
+            c.entries.len(),
+            on_disk.len()
+        );
+        let counted: u64 = c.entries.values().map(|(_, size)| *size).sum();
+        assert_eq!(counted, c.used_bytes, "byte count disagrees with the index");
+        assert!(c.used_bytes <= c.max_bytes, "cache is over its budget");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

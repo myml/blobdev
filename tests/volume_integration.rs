@@ -1176,7 +1176,7 @@ fn the_volume_survives_losing_its_local_metadata() {
 
     // A second open must not need the store at all.
     let err = Volume::open(
-        Arc::new(WholeObjects(DirStore::new(&root.join("gone")).unwrap())),
+        Arc::new(WholeObjects(DirStore::new(root.join("gone")).unwrap())),
         Box::new(FileMeta::new(&meta_path)),
         Layout::new("vol"),
         None,

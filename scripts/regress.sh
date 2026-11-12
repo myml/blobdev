@@ -71,7 +71,8 @@ run_step "outage handling" /tmp/outage.sh
 run_step "crash recovery" /tmp/crash-recovery.sh 2 8
 run_step "boundaries" /tmp/boundaries.sh dir
   # Every flag refuses what it cannot mean.
-  run_step "argument handling" /tmp/args.sh
+  cp /root/blobdev/README.md /tmp/README.md 2>/dev/null; cp "$(dirname "$0")/README.md" /tmp/README.md 2>/dev/null
+run_step "argument handling" /tmp/args.sh
 # The unit an operator will actually use, run the way they will use it.
 run_step "systemd unit" /tmp/systemd-check.sh 3
 

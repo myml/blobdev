@@ -90,6 +90,20 @@ expect_reject "create-size twice" "more than once" \
 expect_reject "id twice" "more than once" \
   "${base[@]}" --create-size 64M --id 3 --id 4
 
+echo "== every option is documented"
+# Eight options lived only in --help until someone looked. A new flag that
+# nobody documents is invisible to anyone reading the README.
+HELP=$("$BIN" --help 2>&1)
+UNDOC=""
+for f in $(echo "$HELP" | grep -oE "^  --[a-z-]+" | tr -d ' '); do
+  grep -q -- "$f" /tmp/README.md 2>/dev/null || UNDOC="$UNDOC $f"
+done
+if [ -z "$UNDOC" ]; then
+  echo "  ok   all help options appear in the README"; PASS=$((PASS + 1))
+else
+  echo "  FAIL undocumented:$UNDOC"; FAIL=$((FAIL + 1))
+fi
+
 echo "== environment"
 # A bad value used to fall back silently: BLOBDEV_SUMMARY_SECS=abc looked the
 # same as the setting working, and the person watching for the periodic line

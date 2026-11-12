@@ -66,6 +66,13 @@ impl Target {
         let maintenance = spawn_maintenance(volume.clone(), wake.clone(), self.interval);
 
         let max_io = BLOCK as usize * 64;
+        // libublk prints "io thread 0/1" per queue, which reads like one
+        // thread in total. Say the shape once, in our own words.
+        log::info!(
+            "ublk device: {} queue(s) of {} tags each",
+            self.queues,
+            self.depth
+        );
         let ctrl = UblkCtrlBuilder::default()
             .name("blobdev")
             .id(self.id)

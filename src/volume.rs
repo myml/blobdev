@@ -465,11 +465,16 @@ impl Volume {
                 geometry.validate()?;
                 let snap = Snapshot::new(geometry.clone());
                 meta.save(&snap)?;
+                // The object size decides how much a small write costs and
+                // how much a read over the threshold fetches, so it belongs in
+                // the line that describes the volume rather than only in the
+                // --help text for the flag that set it.
                 log::info!(
-                    "created volume {} ({} MiB, {} MiB chunks, metadata in {})",
+                    "created volume {} ({} MiB, {} MiB chunks of {} MiB objects, metadata in {})",
                     layout.root,
                     size >> 20,
                     geometry.chunk_size >> 20,
+                    geometry.object_size >> 20,
                     meta.name()
                 );
                 snap

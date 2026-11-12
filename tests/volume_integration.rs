@@ -1050,7 +1050,6 @@ fn a_read_larger_than_the_memory_cache_still_succeeds() {
     let objects = root.join("objects");
     let meta_path = root.join("meta");
     let cache_dir = root.join("cache");
-    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
 
     // 16 MiB of data: four objects' worth.
     let blocks = (16u64 * 1024 * 1024 / BLOCK) as usize;

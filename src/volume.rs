@@ -778,12 +778,26 @@ impl Volume {
                 continue;
             }
 
+            // The memory cache is an LRU bounded by --read-chunks. A single
+            // large read can ask for more objects than it holds, so an object
+            // planned a moment ago may already have been evicted. That is a
+            // tuning effect, not a broken read: consult the disk cache before
+            // giving up, and only then report.
+            if self.read_cache.get(id).is_none() {
+                let obj_len = self.geometry.object_len(id);
+                if let Some(c) = self.disk_cache.as_mut().and_then(|dc| dc.get(id, obj_len)) {
+                    self.read_cache.insert(id, c);
+                }
+            }
             let src: &[u8] = if let Some(w) = self.working.get(&id) {
                 &w.data
             } else if let Some(d) = self.read_cache.get(id) {
                 d
             } else {
-                anyhow::bail!("object {id} missing from cache after planning a read");
+                anyhow::bail!(
+                    "object {id} missing from cache after planning a read \
+                     (it was evicted before use; raise --read-chunks if this repeats)"
+                );
             };
             if src.len() < local + n {
                 anyhow::bail!("object {id} shorter than expected");

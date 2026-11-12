@@ -1011,3 +1011,88 @@ fn opening_a_large_volume_does_not_probe_every_object() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A large read must survive the memory cache being too small for it.
+///
+/// `--read-chunks` bounds the in-memory LRU. One read can ask for more objects
+/// than it holds, so an object planned a moment ago may already be evicted by
+/// the time it is copied out. That is a tuning effect, not a broken read: the
+/// disk cache still has it, and failing the IO would turn a small cache into
+/// an unreadable volume.
+#[test]
+fn a_read_larger_than_the_memory_cache_still_succeeds() {
+    // Whole-object replacement, so every object comes from the store on a
+    // miss and the disk cache is what saves the second attempt.
+    struct WholeObjects(DirStore);
+    impl ObjectStore for WholeObjects {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.0.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.0.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.0.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key)
+        }
+        fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+            self.0.list(prefix)
+        }
+    }
+    let root = std::env::temp_dir().join(format!("blobdev-smallcache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let cache_dir = root.join("cache");
+    let obj_blocks = blobdev::volume::DEFAULT_OBJECT / BLOCK;
+
+    // 16 MiB of data: four objects' worth.
+    let blocks = (16u64 * 1024 * 1024 / BLOCK) as usize;
+    let mut data = vec![0u8; blocks * BLOCK as usize];
+    for b in 0..blocks {
+        data[b * BLOCK as usize..(b + 1) * BLOCK as usize].fill((b % 251) as u8);
+    }
+
+    {
+        let store = Arc::new(WholeObjects(DirStore::new(&objects).unwrap()));
+        let mut v = Volume::open_with_cache(
+            store,
+            Box::new(FileMeta::new(&meta_path)),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+            Some(blobdev::volume::DiskCache::new(&cache_dir, 64 << 20)),
+        )
+        .unwrap();
+        v.write(0, blocks, &data).unwrap();
+        v.flush().unwrap();
+    }
+
+    // A memory cache that holds a single object.
+    let policy = Policy {
+        read_chunks: 1,
+        ..Policy::default()
+    };
+    let store = Arc::new(WholeObjects(DirStore::new(&objects).unwrap()));
+    let mut v = Volume::open_with_cache(
+        store,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        None,
+        policy,
+        Some(blobdev::volume::DiskCache::new(&cache_dir, 64 << 20)),
+    )
+    .unwrap();
+
+    let mut got = vec![0u8; data.len()];
+    v.read(0, blocks, &mut got)
+        .expect("a read spanning more objects than the memory cache holds must still work");
+    assert_eq!(got, data, "the data came back wrong");
+    std::fs::remove_dir_all(&root).ok();
+}

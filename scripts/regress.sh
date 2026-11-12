@@ -66,11 +66,30 @@ run_step "crash recovery" /tmp/crash-recovery.sh 2 8
 run_step "boundaries" /tmp/boundaries.sh dir
 
 if [ "$QUICK" != "--quick" ]; then
-  echo "== load"
+  # A step that needs environment of its own.
+run_step_env() {
+  local name=$1 envs=$2 backend=$3 script=$4
+  clean
+  export BIN
+  local log=$W/$(echo "$name" | tr ' /' '__').log
+  local t0 t1
+  t0=$(date +%s)
+  if timeout 900 env $envs BACKEND_ARGS="$backend" bash "$script" > "$log" 2>&1; then
+    t1=$(date +%s); record "$name" PASS "$((t1 - t0))s"
+  else
+    t1=$(date +%s)
+    local why
+    why=$(grep -iE "^FAIL|^blobdev:|error" "$log" 2>/dev/null | head -1 | cut -c1-70)
+    record "$name" FAIL "$((t1 - t0))s ${why:-}"
+  fi
+  clean
+}
+
+echo "== load"
   run_step "concurrency 4 writers" /tmp/concurrent.sh 60 4
-  run_step "stress 2 min" bash -c \
-    'env BIN=/usr/local/bin/blobdev ROOT=/root/bd-test/regress/stress VOL=rg$RANDOM SIZE=512M MB=64 SECONDS_TO_RUN=120 \
-     BACKEND_ARGS="--backend dir --dir /root/bd-test/regress/objs" bash /tmp/stress.sh'
+  run_step_env "stress 2 min" \
+    "ROOT=/root/bd-test/regress/stress SIZE=512M MB=64 SECONDS_TO_RUN=120" \
+    "--backend dir --dir /root/bd-test/regress/objs" /tmp/stress.sh
 fi
 
 echo

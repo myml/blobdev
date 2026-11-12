@@ -5,7 +5,7 @@
 # usage: stress.sh  (env: BIN, BACKEND_ARGS, ROOT, VOL, SIZE, MB, SECONDS)
 set -u
 BIN=${BIN:-./target/release/blobdev}
-ROOT=${ROOT:-/tmp/blobdev-stress}
+ROOT=${ROOT:-/var/tmp/blobdev-stress}
 VOL=${VOL:-stress}
 SIZE=${SIZE:-1G}
 MB=${MB:-200}
@@ -37,10 +37,12 @@ start() {
 
 # /tmp is often a tmpfs on test hosts. Filling it makes later runs fail in a
 # way that looks like a blobdev bug, so refuse to start without room.
-AVAIL_KB=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+SPACE_DIR=$(dirname "${ROOT:-${W:-/var/tmp}}")
+mkdir -p "$SPACE_DIR" 2>/dev/null
+AVAIL_KB=$(df -Pk "$SPACE_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
 if [ -n "${AVAIL_KB:-}" ] && [ "$AVAIL_KB" -lt $((1024 * 1024)) ]; then
-  echo "FAIL: less than 1 GiB free in /tmp" >&2
-  df -h /tmp >&2
+  echo "FAIL: less than 1 GiB free in $SPACE_DIR" >&2
+  df -h "$SPACE_DIR" >&2
   exit 1
 fi
 

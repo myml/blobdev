@@ -24,8 +24,19 @@ fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// The help text, on stdout, for an explicit request.
+fn usage_stdout() {
+    println!("{}", usage_text());
+}
+
+/// The help text, on stderr, when a command line is wrong.
 fn usage() -> ! {
-    eprintln!(
+    eprintln!("{}", usage_text());
+    std::process::exit(1)
+}
+
+fn usage_text() -> String {
+    format!(
         "usage:
   blobdev run --volume NAME --create-size SIZE [options]
   blobdev stop --id N
@@ -61,8 +72,7 @@ options:
   --cache-size SIZE  disk read cache budget, e.g. 20G (default 64M, 0 disables)
   --retries N        attempts per request on transient failures (default 4)
   --timeout S        per-request timeout in seconds, 0 for none (default 60)"
-    );
-    std::process::exit(2)
+    )
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -109,6 +119,11 @@ fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else { usage() };
     match cmd.as_str() {
+        // Asking for help is not an error, and it should not need a volume.
+        "-h" | "--help" | "help" => {
+            usage_stdout();
+            std::process::exit(0);
+        }
         "run" => run(&args),
         "stop" => stop(&args),
         "status" => status(&args),
@@ -370,10 +385,21 @@ fn inspect(args: &[String]) -> Result<()> {
         // uid 0 marks an object patched in place and keyed by its index; it is
         // not a real uid. Treating it as one names object 0, so every patched
         // object would be reported as missing while the objects sit there.
+        //
+        // Every other object is keyed `u<uid>`, and volumes written before that
+        // prefix used `<uid>`. Checking only the old spelling reported every
+        // object of a current volume as missing -- the worst possible answer
+        // from the one command meant to diagnose a disagreement.
         let key = if st.uid == 0 {
             format!("{volume_name}/c/{id}")
         } else {
-            format!("{volume_name}/c/{}", st.uid)
+            let current = format!("{volume_name}/c/u{}", st.uid);
+            let old = format!("{volume_name}/c/{}", st.uid);
+            if store.stat(&current)?.is_some() || store.stat(&old)?.is_none() {
+                current
+            } else {
+                old
+            }
         };
         match store.stat(&key)? {
             Some(size) => {

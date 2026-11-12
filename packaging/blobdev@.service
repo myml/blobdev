@@ -9,14 +9,22 @@ Type=simple
 # The volume name selects /etc/blobdev/<volume>.conf for its settings.
 EnvironmentFile=/etc/blobdev/%i.conf
 ExecStart=/usr/local/bin/blobdev run $BLOBDEV_ARGS
-# A flush on SIGTERM uploads every dirty chunk before exiting.
+# A flush on SIGTERM uploads every dirty chunk before exiting, and then the
+# process ends immediately. The timeout is a backstop for a store that has
+# stopped answering, not the expected duration.
 KillSignal=SIGTERM
-TimeoutStopSec=300
+TimeoutStopSec=120
 Restart=on-failure
 RestartSec=5s
 
 # The process only needs its metadata file and cache directory, plus the
 # block-device node it creates.
+#
+# ProtectSystem=strict makes everything outside ReadWritePaths read-only, so
+# --meta and --cache-dir must live under one of those paths. A volume whose
+# metadata is somewhere else needs that directory added here, or the daemon
+# will fail to write it and the volume will be unable to recover after a
+# restart.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

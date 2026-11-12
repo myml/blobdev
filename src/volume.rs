@@ -541,15 +541,33 @@ impl Volume {
         let mut legacy_only = 0u32;
         let mut both = 0u32;
         let mut neither = Vec::new();
+        let mut undecided = false;
         for (id, st) in &snap.chunks {
             if !st.uploaded || st.uid == 0 {
                 continue;
             }
-            let has_current = self.data.stat(&self.layout.chunk_key(st.uid))?.is_some();
-            let has_old = self
-                .data
-                .stat(&self.layout.legacy_chunk_key(st.uid as u64))?
-                .is_some();
+            // A store that cannot answer is not a reason to refuse to start.
+            // Refusing meant a volume could not be opened at all during an
+            // outage, when the read cache and metadata are still perfectly
+            // usable -- the mount is what an operator needs first. The
+            // spelling falls back to the default here and is settled on a
+            // later open, once the store is answering.
+            let probe = |key: String| -> Option<bool> {
+                match self.data.stat(&key) {
+                    Ok(v) => Some(v.is_some()),
+                    Err(e) => {
+                        log::warn!("cannot reach the store while opening: {e:#}");
+                        None
+                    }
+                }
+            };
+            let (Some(has_current), Some(has_old)) = (
+                probe(self.layout.chunk_key(st.uid)),
+                probe(self.layout.legacy_chunk_key(st.uid as u64)),
+            ) else {
+                undecided = true;
+                break;
+            };
             match (has_current, has_old) {
                 (true, false) => current_only += 1,
                 (false, true) => legacy_only += 1,
@@ -557,7 +575,15 @@ impl Volume {
                 (false, false) => neither.push(*id),
             }
         }
-        self.legacy_uid_keys = legacy_only > current_only;
+        if undecided {
+            log::warn!(
+                "could not decide the object key spelling: the store did not answer. \
+                 Assuming u<uid>; a volume written before that prefix will not read correctly \
+                 until it can be opened while the store is reachable"
+            );
+        } else {
+            self.legacy_uid_keys = legacy_only > current_only;
+        }
         if !neither.is_empty() {
             log::warn!(
                 "{} object(s) are missing from the store: {:?}",

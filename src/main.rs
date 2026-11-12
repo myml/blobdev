@@ -81,6 +81,23 @@ fn arg(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+/// Refuse a flag given twice.
+///
+/// `arg` takes the first match, so a second value is silently ignored -- which
+/// reads as "I changed the size and it kept the old one". Found while testing
+/// bad sizes: a base --create-size 64M made every invalid size below it look
+/// accepted, because the invalid one was never read.
+fn reject_duplicates(args: &[String]) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for a in args.iter().filter(|a| a.starts_with("--")) {
+        if seen.contains(&a.as_str()) {
+            anyhow::bail!("{a} given more than once");
+        }
+        seen.push(a);
+    }
+    Ok(())
+}
+
 /// Parse a request timeout in seconds; `0` means no limit.
 fn parse_timeout(s: &str) -> Result<Option<Duration>> {
     let secs: u64 = s.trim().parse().context("bad --timeout, expected seconds")?;
@@ -91,6 +108,23 @@ fn parse_timeout(s: &str) -> Result<Option<Duration>> {
 }
 
 /// Parse sizes like `1G`, `500M`, `4096`.
+/// Device ids the kernel accepts: -1 means "pick one", otherwise 0..=2^20-1.
+///
+/// Past that the kernel answers EOPNOTSUPP, which the create path reports as a
+/// leftover device -- the wrong diagnosis twice over, since 1048576 can never
+/// be a device id. A negative id other than -1 gets InvalidVal from the
+/// kernel, which says nothing at all.
+fn parse_id(s: &str) -> Result<i32> {
+    let n: i64 = s.parse().with_context(|| format!("bad --id {s}"))?;
+    if n == -1 {
+        return Ok(-1);
+    }
+    if !(0..=0xFFFFF).contains(&n) {
+        anyhow::bail!("--id must be -1 (pick one) or 0..1048575, not {n}");
+    }
+    Ok(n as i32)
+}
+
 fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
@@ -101,7 +135,11 @@ fn parse_size(s: &str) -> Result<u64> {
         _ => (s, 1),
     };
     let n: u64 = num.parse().with_context(|| format!("bad size {s}"))?;
-    Ok(n * mult)
+    // Checked: `n * mult` wraps in release builds, so "18446744073709551615T"
+    // became a 16 PiB volume instead of an error. A typo that adds a digit
+    // should be refused, not turned into a volume nobody can use.
+    n.checked_mul(mult)
+        .with_context(|| format!("size {s} is too large"))
 }
 
 fn main() {
@@ -234,6 +272,7 @@ fn warn_if_ephemeral(meta: &std::path::Path) {
 }
 
 fn run(args: &[String]) -> Result<()> {
+    reject_duplicates(args)?;
     let backend = arg(args, "--backend").unwrap_or_else(|| "dir".to_string());
     if !matches!(backend.as_str(), "dir" | "s3" | "webdav") {
         anyhow::bail!("unknown backend {backend} (expected dir, s3 or webdav)");
@@ -265,10 +304,18 @@ fn run(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(format!("{volume_name}.meta")));
     warn_if_ephemeral(&meta_path);
     let policy = Policy {
-        full_pct: arg(args, "--full-pct")
-            .map(|s| s.parse())
-            .transpose()?
-            .unwrap_or(50),
+        // A percentage above 100 means "never full", which is what 0 already
+        // means; accepting it quietly hides a typo.
+        full_pct: {
+            let p: u64 = arg(args, "--full-pct")
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(50);
+            if p > 100 {
+                anyhow::bail!("--full-pct must be 0..=100, not {p}");
+            }
+            p
+        },
         max_age: std::time::Duration::from_secs(
             arg(args, "--max-age")
                 .map(|s| s.parse())
@@ -358,18 +405,32 @@ fn run(args: &[String]) -> Result<()> {
     }
 
     let target = blobdev::ublk_tgt::Target {
-        id: arg(args, "--id")
-            .map(|s| s.parse())
-            .transpose()?
-            .unwrap_or(-1),
-        queues: arg(args, "--queues")
-            .map(|s| s.parse())
-            .transpose()?
-            .unwrap_or(1),
-        depth: arg(args, "--depth")
-            .map(|s| s.parse())
-            .transpose()?
-            .unwrap_or(64),
+        id: match arg(args, "--id") {
+            Some(s) => parse_id(&s)?,
+            None => -1,
+        },
+        // Zero queues or zero tags is not a device: the kernel rejects it
+        // with EOPNOTSUPP, which the create path reports as a leftover device.
+        queues: {
+            let q: u16 = arg(args, "--queues")
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(1);
+            if q == 0 {
+                anyhow::bail!("--queues must be at least 1");
+            }
+            q
+        },
+        depth: {
+            let d: u16 = arg(args, "--depth")
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(64);
+            if d == 0 {
+                anyhow::bail!("--depth must be at least 1");
+            }
+            d
+        },
         interval: std::time::Duration::from_secs(1),
     };
     target.run(volume, drain, stop, exit_after)

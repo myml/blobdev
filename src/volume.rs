@@ -993,12 +993,15 @@ impl Volume {
         // are failing sends about once a second -- 40 requests in 40 idle
         // seconds, each one doomed, for as long as the client keeps trying.
         // The data stays in the working copy and goes up on a later call.
-        if let Some(until) = self.backoff.get(&id) {
-            if *until > std::time::Instant::now() {
+        if let Some(until) = self.backoff.get(&id).copied() {
+            if until > std::time::Instant::now() {
                 anyhow::bail!(
                     "object {id}: last upload failed, waiting before trying again"
                 );
             }
+            // The wait is over; drop the entry rather than letting it sit in
+            // the map for the life of the process.
+            self.backoff.remove(&id);
         }
 
         // Ask the store each time: a backend that has just discovered it

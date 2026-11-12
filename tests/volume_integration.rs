@@ -823,3 +823,100 @@ fn metadata_with_out_of_range_indices_is_rejected() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A failed upload waits before trying again, and forgets that it waited.
+///
+/// Against a store refusing everything, the old code re-attempted on every
+/// FLUSH -- about once a second -- for as long as the client kept trying.
+/// The wait fixes that; the entry has to go once it has expired, or a volume
+/// that had a bad afternoon carries a map of every object that ever failed.
+#[test]
+fn a_failed_upload_backs_off_and_then_forgets() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Refusing {
+        inner: DirStore,
+        refuse: std::sync::Arc<AtomicBool>,
+        attempts: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+    impl ObjectStore for Refusing {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            if self.refuse.load(Ordering::SeqCst) {
+                self.attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("store is refusing everything");
+            }
+            self.inner.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-backoff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let objects = root.join("objects");
+    let meta_path = root.join("meta");
+    let refuse = std::sync::Arc::new(AtomicBool::new(true));
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    let store = Arc::new(Refusing {
+        inner: DirStore::new(&objects).unwrap(),
+        refuse: refuse.clone(),
+        attempts: attempts.clone(),
+    });
+    let mut v = Volume::open(
+        store as Arc<dyn ObjectStore>,
+        Box::new(FileMeta::new(&meta_path)),
+        Layout::new("vol"),
+        Some(Create::new(8 * DEFAULT_CHUNK)),
+        Policy::default(),
+    )
+    .unwrap();
+
+    let buf = vec![7u8; (8 * BLOCK) as usize];
+    let blocks = (8 * BLOCK / BLOCK) as usize;
+    v.write(0, blocks, &buf).unwrap();
+
+    // The first flush reaches the store and fails.
+    assert!(v.flush().is_err(), "a refusing store must fail the flush");
+    let after_first = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(after_first >= 1, "the store should have been asked once");
+
+    // Subsequent flushes must not ask again while the wait holds.
+    for _ in 0..5 {
+        let _ = v.flush();
+    }
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        after_first,
+        "the store was asked again while the object was backing off"
+    );
+
+    // While the store is still refusing, the wait keeps holding.
+    assert!(v.flush().is_err());
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        after_first,
+        "the wait stopped holding while the store was still refusing"
+    );
+
+    // The bytes are still there: reading does not depend on the upload.
+    let mut got = vec![0u8; buf.len()];
+    v.read(0, blocks, &mut got).unwrap();
+    assert_eq!(got, buf, "the data was lost while the upload was failing");
+    std::fs::remove_dir_all(&root).ok();
+}

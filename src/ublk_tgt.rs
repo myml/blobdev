@@ -128,7 +128,8 @@ impl Target {
         let st = stop.clone();
         let device_fn = move |c: &UblkCtrl| {
             log::info!("created /dev/ublkb{}", c.dev_info().dev_id);
-            spawn_drain_watcher(s.volume.clone(), d, st, exit_after.clone());
+            let dev_id = c.dev_info().dev_id as i32;
+            spawn_drain_watcher(s.volume.clone(), d, st, exit_after.clone(), dev_id);
         };
 
         let _ = ctrl.run_target(tgt_init, q_fn, device_fn);
@@ -201,6 +202,15 @@ fn spawn_maintenance(
     }
 }
 
+/// Remove a ublk device by id, the same way `blobdev stop` does.
+fn del_device(id: i32) -> Result<()> {
+    let ctrl = libublk::ctrl::UblkCtrl::new_simple(id)
+        .with_context(|| format!("open ublk device {id}"))?;
+    ctrl.del_dev_async()
+        .with_context(|| format!("delete device {id}"))?;
+    Ok(())
+}
+
 /// What to check when the kernel refuses to make a ublk device.
 ///
 /// The kernel says the same thing whether the driver is missing or a device
@@ -228,6 +238,7 @@ fn spawn_drain_watcher(
     drain: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     exit_after: Arc<ExitRequest>,
+    dev_id: i32,
 ) {
     thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
@@ -238,19 +249,32 @@ fn spawn_drain_watcher(
                     Err(e) => log::error!("signal: flush failed: {e:#}"),
                 }
                 // A signal must be able to stop the service. Flush first so
-                // nothing is lost, then exit: tearing the device down from
-                // this thread used to deadlock, so the process exits and the
-                // kernel removes the device when its handles close.
+                // nothing is lost, then let the target loop end normally so
+                // the device is torn down.
+                //
+                // Exiting from here used to be `_exit(0)`, on the assumption
+                // that "the kernel removes the device when its handles close".
+                // It does not: the device stayed in /sys/class/ublk-char, held
+                // its id, and the next start failed with EOPNOTSUPP because
+                // that id was still in use. A 5 GiB volume could be written
+                // and stopped and then never mounted again without a manual
+                // `blobdev stop --id N`.
                 if exit_after.is_requested() {
-                    log::info!("signal: exiting after flushing");
-                    // `process::exit` runs atexit handlers and flushes the
-                    // stdio locks, which can block behind a logging thread
-                    // that never finishes -- the process logged "exiting" and
-                    // then sat there for as long as anyone watched. Every byte
-                    // that matters is already in the metadata and the object
-                    // store by now, so terminate immediately.
-                    // SAFETY: nothing below needs unwinding or cleanup.
-                    unsafe { libc::_exit(0) }
+                    // Ask the kernel to remove the device. That is what makes
+                    // the queue loops end, which is what lets run_target
+                    // return, which is what tears everything down.
+                    //
+                    // `_exit` here was wrong twice over: it skipped the
+                    // teardown, so the device stayed in /sys/class/ublk-char
+                    // and held its id -- the next start failed with
+                    // EOPNOTSUPP -- and the process still took a minute to
+                    // die because a signal handler cannot end the queue
+                    // threads' wait.
+                    log::info!("signal: flushed; removing device {dev_id}");
+                    if let Err(e) = del_device(dev_id) {
+                        log::error!("signal: could not remove device {dev_id}: {e:#}");
+                    }
+                    stop.store(true, Ordering::SeqCst);
                 }
             }
             thread::sleep(Duration::from_millis(100));

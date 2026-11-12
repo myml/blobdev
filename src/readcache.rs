@@ -127,10 +127,17 @@ impl ReadCache {
                 let _ = fs::remove_file(&path);
                 continue;
             }
-            self.used_bytes += meta.len();
+            // Only files this cache wrote count. Anything else -- a stray
+            // file, an editor backup, a half-created name -- used to be added
+            // to used_bytes and then skipped, which is the worst combination:
+            // the cache reports itself full, eviction cannot free the space
+            // because the file is not in the index, and every later put pays
+            // for a scan that cannot help. Leave it alone on disk; just do not
+            // count it.
             let Ok(id) = entry.file_name().to_string_lossy().parse::<u64>() else {
                 continue;
             };
+            self.used_bytes += meta.len();
             let mut gen = 0;
             if let Ok(mut f) = fs::File::open(&path) {
                 let mut h = [0u8; HEADER];
@@ -486,6 +493,32 @@ mod tests {
 #[cfg(test)]
 mod index_tests {
     use super::*;
+
+    /// A file the cache did not write must not make it think it is full.
+    ///
+    /// Rescan used to add every file's size to used_bytes and then skip the
+    /// ones whose names were not numbers -- so a stray 1 MB file against a
+    /// 64 KB budget left the cache permanently over budget, with eviction
+    /// unable to recover anything because the file was never in the index.
+    #[test]
+    fn a_stray_file_does_not_fill_the_cache() {
+        let dir = std::env::temp_dir().join(format!("blobdev-rcstray-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("vol")).unwrap();
+        fs::write(dir.join("vol").join("not-an-entry"), vec![0u8; 1_000_000]).unwrap();
+        let mut c = ReadCache::open(&dir, "vol", 64 * 1024).unwrap();
+        assert_eq!(c.used_bytes, 0, "a file the cache did not write was counted");
+        for id in 0..40u64 {
+            c.put(id, &vec![1u8; 4096]).unwrap();
+        }
+        assert!(
+            c.used_bytes <= c.max_bytes,
+            "cache is over its budget: {} > {}",
+            c.used_bytes,
+            c.max_bytes
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The index must match what is on disk after eviction.
     ///

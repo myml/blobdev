@@ -136,6 +136,10 @@ WebDAV 支持 `Content-Range`，可以只写改动的部分。**
 | 2048 KiB | 4096 KiB | 2.00× |
 | 4096 KiB（整个 object） | 4096 KiB | 1.00× |
 
+（上表来自直接调用 `plan_read` 的测量；单元测试
+`a_small_read_fetches_only_the_range_it_needs` 守着它，把"取全对象"的行为注入
+回去会立刻失败。）
+
 **注意 1 MiB 处的跳变**：读 1023 KiB 只取 1023 KiB（1×），读 1024 KiB 取整个
 4 MiB（4×）。这是有意的权衡——顺序读者跨过 25% 后取全对象，后续 3 MiB 免费；
 一次性读 1 MiB 的读者则多付 3 MiB。**读的时候无法预知会不会继续**，25% 是
@@ -144,8 +148,21 @@ WebDAV 支持 `Content-Range`，可以只写改动的部分。**
 
 **两级缓存**：
 
-- **内存 LRU**（`--read-chunks`，默认 64 个 **object**，约 256 MiB）：热数据，零 IO。
-  单位是 object 不是 chunk：一个 64 MiB 的 chunk 里有 16 个 object
+- **内存 LRU**（`--read-chunks`，默认 64 个 **object**）：热数据，零 IO。
+  单位是 object 不是 chunk：一个 64 MiB 的 chunk 里有 16 个 object。
+
+  **实测 RSS**（2 GiB 卷，目录后端）：
+
+  | 时点 | RSS |
+  |---|---|
+  | 刚启动 | **4 MiB** |
+  | `mkfs.ext4` 之后（还没挂载） | **115 MiB** |
+  | 写 64 MiB 后 | 213 MiB |
+  | 写 320 MiB 后（超过 64 对象的缓存） | 345 MiB |
+
+  `mkfs` 之后那 111 MiB 值得注意：**写入的数据会被同时放进读缓存**（写入即缓存，
+  省掉一次回读），所以格式化这种只写不读的操作也会占满缓存。`--read-chunks 1`
+  时同样的 `mkfs` 只到 28 MiB。不想让格式化或批量写入占内存，就把这个值调小。
 - **磁盘缓存**（`--cache-dir` + `--cache-size`）：**重启后仍然命中**，容量不受内存限制
 
 磁盘缓存每个 **object** 一个文件（不是 chunk：64 MiB 的 chunk 里有 16 个 object），
@@ -247,7 +264,7 @@ umount /mnt          # 触发 flush，所有脏 chunk 上传
 | `--chunk-mib N` | 64 | 逻辑 chunk 大小，只在建卷时生效，之后由元数据决定 |
 | `--object-mib N` | 4 | 存储对象大小。**chunk 必须是它的整数倍**（如 64/4）。越小越省带宽、请求越多 |
 | `--cache-dir` / `--cache-size` | 无 / 64M | 磁盘读缓存，重启后仍命中。`0` 关闭 |
-| `--read-chunks N` | 64 | 内存里保留多少个**对象**。每个对象 4 MiB，**默认就是 256 MiB 内存**；实测缓存 32 个对象时 RSS 136 MiB。内存紧的机器调小 |
+| `--read-chunks N` | 64 | 内存里保留多少个**对象**。每个对象 4 MiB，缓存满时约 256 MiB。**实测 RSS 见下表**，内存紧的机器调小 |
 | `--full-pct N` | 50 | 对象脏块达到 N% 就上传。**顺序大文件写到 100 避免重复上传** |
 | `--max-age S` | 30 | 脏超过 S 秒就上传 |
 | `--whole-chunk-pct N` | 25 | 一次读覆盖对象 N% 以上时，拉整个对象并缓存 |

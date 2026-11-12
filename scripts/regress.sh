@@ -91,6 +91,8 @@ echo "== load"
   run_step "concurrency 4 writers" /tmp/concurrent.sh 60 4
   # Several volumes and the commands that manage them while they run.
   run_step "multiple volumes" /tmp/multivolume.sh
+  # Size, not just correctness: 1 GiB of data on a 5 GiB volume.
+  run_step "real scale 1 GiB" /tmp/realscale.sh dir
   run_step_env "stress 2 min" \
     "ROOT=/root/bd-test/regress/stress SIZE=512M MB=64 SECONDS_TO_RUN=120" \
     "--backend dir --dir /root/bd-test/regress/objs" /tmp/stress.sh

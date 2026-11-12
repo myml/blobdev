@@ -138,7 +138,8 @@ WebDAV 支持 `Content-Range`，可以只写改动的部分。**
 
 **两级缓存**：
 
-- **内存 LRU**（`--read-chunks`，默认 64 个 object）：热数据，零 IO
+- **内存 LRU**（`--read-chunks`，默认 64 个 **object**，约 256 MiB）：热数据，零 IO。
+  单位是 object 不是 chunk：一个 64 MiB 的 chunk 里有 16 个 object
 - **磁盘缓存**（`--cache-dir` + `--cache-size`）：**重启后仍然命中**，容量不受内存限制
 
 磁盘缓存每个 chunk 一个文件，带 CRC 和长度校验；**校验失败只当未命中并重删**，
@@ -239,7 +240,7 @@ umount /mnt          # 触发 flush，所有脏 chunk 上传
 | `--chunk-mib N` | 64 | 逻辑 chunk 大小，只在建卷时生效，之后由元数据决定 |
 | `--object-mib N` | 4 | 存储对象大小。**chunk 必须是它的整数倍**（如 64/4）。越小越省带宽、请求越多 |
 | `--cache-dir` / `--cache-size` | 无 / 64M | 磁盘读缓存，重启后仍命中。`0` 关闭 |
-| `--read-chunks N` | 64 | 内存里保留多少个对象 |
+| `--read-chunks N` | 64 | 内存里保留多少个**对象**。每个对象 4 MiB，**默认就是 256 MiB 内存**；实测缓存 32 个对象时 RSS 136 MiB。内存紧的机器调小 |
 | `--full-pct N` | 50 | 对象脏块达到 N% 就上传。**顺序大文件写到 100 避免重复上传** |
 | `--max-age S` | 30 | 脏超过 S 秒就上传 |
 | `--whole-chunk-pct N` | 25 | 一次读覆盖对象 N% 以上时，拉整个对象并缓存 |

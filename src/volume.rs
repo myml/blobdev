@@ -211,6 +211,18 @@ impl Fetcher {
     }
 }
 
+/// Memory the machine can hand out without swapping, from MemAvailable.
+fn available_memory_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
 /// What a garbage collection found and did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GcReport {
@@ -465,6 +477,33 @@ impl Volume {
         };
 
         let geometry = snapshot.geometry.clone();
+        // The in-memory cache is bounded by a count, not a size, and the size
+        // of one entry is the object size. Say what that works out to, and say
+        // so loudly if it does not fit: measured on the host, --read-chunks
+        // 4000 grew RSS by 4 MiB per object written until the machine had
+        // nothing left to give.
+        let cache_bytes = (policy.read_chunks as u64).saturating_mul(
+            geometry.object_size.min(geometry.chunk_size),
+        );
+        if cache_bytes > 0 {
+            log::info!(
+                "read cache: {} objects of {} MiB = up to {} MiB of memory",
+                policy.read_chunks,
+                geometry.object_size.min(geometry.chunk_size) >> 20,
+                cache_bytes >> 20
+            );
+            if let Some(avail) = available_memory_bytes() {
+                if cache_bytes > avail {
+                    log::warn!(
+                        "--read-chunks {} can hold {} MiB but only {} MiB of memory is \
+                         available; lower --read-chunks or the machine will run out",
+                        policy.read_chunks,
+                        cache_bytes >> 20,
+                        avail >> 20
+                    );
+                }
+            }
+        }
         let read_cache = LruChunks::new(policy.read_chunks);
         let disk_cache = match disk {
             Some(d) if d.max_bytes > 0 => {

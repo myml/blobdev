@@ -411,11 +411,17 @@ blobdev run ... --id N ...          # 用同样的参数重新起（同一个 --
 mount /dev/ublkbN /mnt/data
 ```
 
-**中间那两步不能省。** 后端掉线时 ext4 会中止 journal（内核日志里是
-`Aborting journal on device ublkbN-8`），之后 `umount` 看似成功，但
-`/dev/ublkbN` 这个块设备节点已经不存在了——`/sys/class/ublk-char/` 里还留着
-`ublkcN`，`mount` 只报 `Can't lookup blockdev`，光看这条信息完全不知道
-是设备没了还是盘坏了。
+**重启这一步不能省。** 后端掉线时 ext4 会中止 journal（内核日志里是
+`Aborting journal on device ublkbN-8`）。之后有两种情况，**取决于 `umount`
+是怎么完成的**：
+
+- `umount` 正常返回：`/dev/ublkbN` 还在，直接 `mount` 能成功
+- `umount` 受阻、只能 `umount -l`：块设备节点跟着消失，
+  `/sys/class/ublk-char/` 里却还留着 `ublkcN`，`mount` 只报
+  `Can't lookup blockdev`——光看这条完全不知道是设备没了还是盘坏了
+
+两种情况都实测到过（同样的测试脚本，不同轮次走不同分支）。**重启守护进程
+在两种情况下都能恢复**，所以照上面的三步做，不用判断自己属于哪种。
 
 实测（Nextcloud + 故障代理断开连接，32 MiB 数据）：
 
@@ -423,7 +429,7 @@ mount /dev/ublkbN /mnt/data
 |---|---|
 | 断网后写入 | **失败**（不会假装成功），`dmesg` 出现 `Aborting journal on device ublkbN-8` |
 | 断网后读 | 仍返回旧数据 |
-| 按旧文档只做 `umount` + `mount` | **`mount` 失败：`Can't lookup blockdev`** |
+| 只做 `umount` + `mount` | **取决于 umount 怎么完成的**（见下） |
 | `umount` → 停守护进程 → 重起 → `mount` | **成功，`sha256` 与写入时一致，写入正常** |
 
 注意 `mount` 显示的还是 `rw`——**ext4 不会因为 journal 中止就把挂载点标成只读**，

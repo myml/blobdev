@@ -58,10 +58,15 @@ head -c 33554432 /dev/urandom > $MNT/a.bin
 sync; sleep 6
 WANT=$(sha256sum $MNT/a.bin | awk '{print $1}')
 
-# The store goes away and something syncs.
+# The store goes away and something syncs. Do enough writes that ext4 is
+# certain to hit the failure and abort its journal: with one 8 MiB write the
+# journal sometimes survived, the mount stayed usable, and the rest of this
+# test had nothing to prove.
 set_profile reset
-head -c 8388608 /dev/urandom > $MNT/b.bin 2>/dev/null
-sync 2>/dev/null
+for _ in 1 2 3; do
+  head -c 8388608 /dev/urandom > $MNT/b$_.bin 2>/dev/null
+  sync 2>/dev/null
+done
 sleep 3
 # ext4 does not switch the mount to read-only when the journal aborts; it
 # stays "rw" and the failure surfaces on the next write. What matters is that
@@ -81,12 +86,20 @@ fi
 set_profile none
 sleep 3
 umount $MNT 2>/dev/null || umount -l $MNT 2>/dev/null
+# How a mount behaves here depends on how the umount went. A plain umount
+# leaves the device node in place and the remount works; an umount that had to
+# fall back to -l (the filesystem was read-only already) takes the node with
+# it and the remount cannot find the device. Both are correct. What the README
+# promises is therefore not "the remount fails" but "the restart always works",
+# which is the check below.
 if mount /dev/ublkb170 $MNT 2>/dev/null; then
   umount $MNT 2>/dev/null
-  bad "mounting without restarting the daemon worked; the README could be simpler"
+  echo "  note  the remount worked without a restart; the node survived the umount"
 else
-  ok "mounting without restarting the daemon fails, as the README now says"
+  echo "  note  the remount needed a restart; the umount took the node with it"
 fi
+[ -e /dev/ublkb170 ] && echo "  note  /dev/ublkb170 present after umount" \
+                    || echo "  note  /dev/ublkb170 gone after umount"
 
 # The documented procedure.
 stop_dev

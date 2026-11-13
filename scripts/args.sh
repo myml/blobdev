@@ -116,6 +116,30 @@ else
   echo "  FAIL bad BLOBDEV_SUMMARY_SECS was ignored silently"; FAIL=$((FAIL + 1))
 fi
 
+echo "== geometry flags on an existing volume"
+# These only apply at creation. Asking for different ones later used to be
+# dropped without a word -- and with no --create-size present, not even parsed.
+GD="$W/geom"; rm -rf "$GD"; mkdir -p "$GD"
+timeout 5 "$BIN" run --backend dir --dir "$GD/o" --volume geom1 --meta "$GD/v.meta" \
+  --id -1 --create-size 128M --chunk-mib 64 --object-mib 4 >/dev/null 2>&1
+pkill -9 -x blobdev >/dev/null 2>&1; sleep 2
+OUT=$(timeout 5 "$BIN" run --backend dir --dir "$GD/o" --volume geom1 --meta "$GD/v.meta" \
+  --id -1 --chunk-mib 8 --object-mib 1 2>&1 | grep -c "ignored for existing volume")
+pkill -9 -x blobdev >/dev/null 2>&1; sleep 2
+if [ "$OUT" -ge 1 ]; then
+  echo "  ok   changed geometry on an existing volume is reported"; PASS=$((PASS + 1))
+else
+  echo "  FAIL changed geometry was dropped silently"; FAIL=$((FAIL + 1))
+fi
+SAME=$(timeout 5 "$BIN" run --backend dir --dir "$GD/o" --volume geom1 --meta "$GD/v.meta" \
+  --id -1 --chunk-mib 64 2>&1 | grep -c "ignored for existing volume")
+pkill -9 -x blobdev >/dev/null 2>&1; sleep 2
+if [ "$SAME" -eq 0 ]; then
+  echo "  ok   matching geometry says nothing"; PASS=$((PASS + 1))
+else
+  echo "  FAIL matching geometry warned anyway"; FAIL=$((FAIL + 1))
+fi
+
 echo "== required flags"
 expect_reject "no volume" "--volume is required" run --create-size 1G
 expect_reject "cache-size without cache-dir" "--cache-size needs --cache-dir" \

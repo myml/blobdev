@@ -274,6 +274,18 @@ blobdev gc      --volume vol1 ...   # 回收无引用的孤儿对象（先加 --
 
 `--create-size` 只在卷不存在时生效，之后从元数据读几何信息。
 
+**在已有卷上传了不同的尺寸或几何参数，会被忽略并告警**：
+
+```
+WARN --create-size 64 MiB was ignored: volume data already exists at 512 MiB
+WARN ignored for existing volume data: --chunk-mib 8 (volume uses 64),
+     --object-mib 1 (volume uses 4). Geometry is fixed when the volume is
+     created; changing it would not match the objects already stored
+```
+
+`--chunk-mib` / `--object-mib` 也是一样：它们**只在建卷时生效**。以前这四个参数在
+已有卷上被静默丢弃，看起来像是生效了。
+
 挂上之后就是普通块设备：
 
 ```bash

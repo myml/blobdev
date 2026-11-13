@@ -151,6 +151,17 @@ fn reject_duplicates(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A byte count as MiB or GiB, for messages about sizes.
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1 << 30 && bytes % (1 << 30) == 0 {
+        format!("{} GiB", bytes >> 30)
+    } else if bytes % (1 << 20) == 0 {
+        format!("{} MiB", bytes >> 20)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// Parse a request timeout in seconds; `0` means no limit.
 fn parse_timeout(s: &str) -> Result<Option<Duration>> {
     let secs: u64 = s.trim().parse().context("bad --timeout, expected seconds")?;
@@ -468,6 +479,18 @@ fn run(args: &[String]) -> Result<()> {
     } else {
         Box::new(FileMeta::locked(&meta_path)?)
     };
+    let created_size = create.as_ref().map(|c| c.size);
+    // Read the geometry flags directly, not through `create`: those flags are
+    // only parsed when --create-size is present, so asking for --chunk-mib 8
+    // on an existing volume was dropped before anything could notice it.
+    let created_chunk = arg(args, "--chunk-mib")
+        .map(|mib| mib.parse::<u64>().map(|m| m << 20))
+        .transpose()
+        .context("bad --chunk-mib")?;
+    let created_object = arg(args, "--object-mib")
+        .map(|mib| mib.parse::<u64>().map(|m| m << 20))
+        .transpose()
+        .context("bad --object-mib")?;
     let volume = Volume::open_with_cache(
         store,
         meta,
@@ -476,6 +499,57 @@ fn run(args: &[String]) -> Result<()> {
         policy,
         disk_cache,
     )?;
+
+    // --create-size only applies to a new volume. Saying nothing when it was
+    // ignored leaves the operator believing the volume is the size they asked
+    // for: measured, --create-size 64M on an existing 512 MiB volume started
+    // cleanly and gave a 512 MiB device, with nothing in the log about it.
+    // The same applies to the geometry: it is recorded in the metadata at
+    // creation, and a different --chunk-mib or --object-mib on a later start is
+    // ignored. Measured: asking for 8 MiB chunks and 1 MiB objects on a volume
+    // built from 64 MiB chunks and 4 MiB objects left it at 64/4 with nothing
+    // in the log. Data was fine; the operator's mental model was not.
+    {
+        let geometry = volume.geometry();
+        let mut differs: Vec<String> = Vec::new();
+        if let Some(c) = created_chunk {
+            if c != geometry.chunk_size {
+                differs.push(format!(
+                    "--chunk-mib {} (volume uses {})",
+                    c >> 20,
+                    geometry.chunk_size >> 20
+                ));
+            }
+        }
+        if let Some(o) = created_object {
+            if o != geometry.object_size {
+                differs.push(format!(
+                    "--object-mib {} (volume uses {})",
+                    o >> 20,
+                    geometry.object_size >> 20
+                ));
+            }
+        }
+        if !differs.is_empty() {
+            log::warn!(
+                "ignored for existing volume {}: {}. Geometry is fixed when the \
+                 volume is created; changing it would not match the objects already stored",
+                volume_name,
+                differs.join(", ")
+            );
+        }
+    }
+    if let Some(requested) = created_size {
+        if requested != volume.size() {
+            log::warn!(
+                "--create-size {} was ignored: volume {} already exists at {} MiB \
+                 (geometry comes from the metadata; --create-size only applies to a new volume)",
+                human_size(requested),
+                volume_name,
+                volume.size() >> 20
+            );
+        }
+    }
 
     // Block signals before any thread starts, so every thread inherits the mask
     // and only the waiter below receives them.

@@ -269,10 +269,18 @@ blobdev gc      --volume vol1 ...   # 回收无引用的孤儿对象（先加 --
 `inspect` 会逐个检查元数据引用的对象是否真的存在；`gc` 只删除没有任何引用的对象，
 并且在发现引用缺失时会拒绝执行（那时卷已经不一致，删掉剩余对象只会让情况更糟）。
 
-`blobdev stop` 只负责删除设备，**守护进程还要一两秒才退出**（它先把脏数据刷完），
+`blobdev stop` 删除设备后，**守护进程还要约一秒才退出**（它先把脏数据刷完），
 在这之前它还占着元数据锁。所以「stop 之后立刻启动同一个卷」会报
-`another blobdev process is already using this volume (pid N)`——**这是锁在正常工作**，
-等一两秒即可。日志里 `stop` 会说明这一点。
+`another blobdev process is already using this volume (pid N)`。
+
+**给 `stop` 加上 `--meta`，它会等守护进程真正退出再返回**：
+
+```bash
+blobdev stop --id 7 --meta /var/lib/blobdev/data.meta   # 约 1 秒，返回后可以立即重启
+blobdev stop --id 7                                     # 只删设备，不等
+```
+
+用户报告里的 `pid N` 就是锁文件里记的那个进程；`stop --meta` 正是读它来等。
 
 **一个卷只允许一个进程**：`run` 会在元数据旁加 `.lock` 文件独占锁，
 第二个实例会直接报错退出，而不是两个进程互相覆盖元数据。

@@ -39,7 +39,7 @@ fn usage_text() -> String {
     String::from(
         "usage:
   blobdev run --volume NAME --create-size SIZE [options]
-  blobdev stop --id N
+  blobdev stop --id N [--meta PATH]
   blobdev status                         list running and stale devices
   blobdev reap [--dry-run]               remove devices with no daemon
   blobdev gc --volume NAME [--dry-run]   delete unreferenced chunk objects
@@ -744,21 +744,57 @@ fn stop(args: &[String]) -> Result<()> {
     ctrl.del_dev_async()
         .with_context(|| format!("stop device {id}"))?;
     log::info!("device {id} removed");
-    // Deleting the device makes the daemon flush and exit, which takes about
-    // a second -- and until it does, the metadata lock is still held. A script
-    // that stops and starts again immediately gets "another blobdev process
-    // is already using this volume", from the lock doing exactly its job.
-    // Wait for it here so stop means stopped.
     // The device goes before the daemon does: it still has to flush, and it
-    // holds the metadata lock until it exits. There is no reliable way from
-    // here to wait for that -- the only handle is the pid in the lock file,
-    // which sits next to a metadata path this command is not given -- so say
-    // what the caller can rely on rather than pretending to wait.
-    log::info!(
-        "device {id} removed; the daemon exits once it has flushed (a second or \
-         so). Starting the same volume before then fails on the metadata lock"
-    );
+    // holds the metadata lock until it exits. With --meta the pid can be read
+    // out of the lock file, so stop can wait for it -- which is what a script
+    // that stops and starts again needs.
+    //
+    // Without --meta there is nothing here to wait on. pgrep is no good: this
+    // command is also called blobdev, so it matches itself. Nor is /dev/ublkbN:
+    // it is already gone by the time this line runs.
+    match arg(args, "--meta") {
+        Some(meta) => {
+            let lock = std::path::PathBuf::from(meta).with_extension("lock");
+            let pid = std::fs::read_to_string(&lock).ok().and_then(|text| {
+                text.replace("\\n", " ")
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|p| p.parse::<i32>().ok())
+            });
+            match pid {
+                Some(pid) if pid_alive(pid) => {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    while pid_alive(pid) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    log::info!("device {id} stopped, daemon {pid} gone");
+                }
+                _ => log::info!("device {id} removed; no daemon holds {}", lock.display()),
+            }
+        }
+        None => log::info!(
+            "device {id} removed; the daemon exits once it has flushed (a second or \
+             so). Pass --meta to have stop wait for it; starting the same volume \
+             before then fails on the metadata lock"
+        ),
+    }
     Ok(())
+}
+
+/// Whether `pid` exists and is not a zombie.
+///
+/// A daemon that has exited but has not been reaped still has a /proc entry;
+/// its state field is `Z` and it holds nothing.
+fn pid_alive(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state is the first field after the parenthesised command name.
+    match stat.rsplit(')').next() {
+        Some(rest) => !rest.trim_start().starts_with('Z'),
+        None => true,
+    }
 }
 
 /// List the running ublk devices.

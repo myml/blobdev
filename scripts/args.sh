@@ -140,6 +140,20 @@ else
   echo "  FAIL matching geometry warned anyway"; FAIL=$((FAIL + 1))
 fi
 
+echo "== stop waits only when told where the metadata is"
+# The daemon outlives its device by about a second. stop --meta reads the pid
+# from the lock file and waits; stop on its own says it did not.
+SW="$W/stopwait"; rm -rf "$SW"; mkdir -p "$SW"
+"$BIN" run --backend dir --dir "$SW/o" --volume sw1 --meta "$SW/v.meta" --id 7 \
+  --create-size 64M > "$SW/l" 2>&1 &
+for _ in $(seq 1 60); do grep -q "created /dev/ublkb7" "$SW/l" 2>/dev/null && break; sleep 1; done
+OUT=$("$BIN" stop --id 7 --meta "$SW/v.meta" 2>&1 | tail -1)
+case "$OUT" in
+  *"stopped, daemon"*) echo "  ok   stop --meta waited for the daemon"; PASS=$((PASS + 1)) ;;
+  *)                   echo "  FAIL stop --meta returned without waiting: $OUT"; FAIL=$((FAIL + 1)) ;;
+esac
+pkill -9 -x blobdev >/dev/null 2>&1; sleep 2
+
 echo "== required flags"
 expect_reject "no volume" "--volume is required" run --create-size 1G
 expect_reject "cache-size without cache-dir" "--cache-size needs --cache-dir" \

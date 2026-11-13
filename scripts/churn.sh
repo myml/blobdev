@@ -39,7 +39,9 @@ for n in $(seq 1 20); do
   for _ in $(seq 1 60); do mount /dev/ublkb193 $MNT 2>/dev/null && break; sleep 0.3; done
   echo "round $n" >> $MNT/log.txt 2>/dev/null
   umount $MNT 2>/dev/null
-  $BIN stop --id 193 >/dev/null 2>&1
+  # --meta makes stop wait for the daemon to exit, so the next start cannot
+  # collide with a lock its predecessor still holds.
+  $BIN stop --id 193 --meta $W/v.meta >/dev/null 2>&1
   # blobdev stop removes the device but the process exits about a second
   # later, still holding the metadata lock. Starting again before it goes
   # fails with "another blobdev process is already using this volume" -- which

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use blobdev::meta::{ChunkState, FileMeta, Geometry, MetaStore, MirroredMeta, Snapshot};
 use blobdev::store::{Caps, ObjectStore};
 use blobdev::store::{DirStore, MemStore};
-use blobdev::volume::{Create, Layout, Policy, Volume, BLOCK, DEFAULT_CHUNK};
+use blobdev::volume::{Create, Layout, Policy, Volume, BLOCK, DEFAULT_CHUNK, DEFAULT_OBJECT};
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("blobdev-it-{tag}-{}", std::process::id()));
@@ -1673,5 +1673,62 @@ fn reopening_a_volume_uploads_nothing_that_is_already_stored() {
         after_write,
         "reopening the volume uploaded again"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A failed upload must not turn into one identical error per tick.
+///
+/// With the store down, tick() used to return the backoff message on every
+/// call, and the caller logged it: measured on the host, 60 identical lines in
+/// 60 seconds. An object waiting out its backoff is not news.
+#[test]
+fn a_failing_store_does_not_make_tick_report_every_second() {
+    /// A store that fails every write.
+    struct Broken(DirStore);
+    impl ObjectStore for Broken {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.0.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.0.get(key, range)
+        }
+        fn put(&self, _key: &str, _data: &[u8]) -> anyhow::Result<Option<String>> {
+            Err(anyhow::anyhow!("store is down"))
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.0.delete(key)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-quiet-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut v = Volume::open(
+        Arc::new(Broken(DirStore::new(root.join("objects")).unwrap())),
+        Box::new(FileMeta::new(root.join("meta"))),
+        Layout::new("vol"),
+        Some(Create::new(8 * DEFAULT_CHUNK)),
+        // Upload on the first tick so there is a failure to report.
+        Policy {
+            full_pct: 1,
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    let blocks = (DEFAULT_OBJECT / BLOCK) as usize;
+    v.write(0, blocks, &vec![1u8; blocks * BLOCK as usize]).unwrap();
+
+    // The first tick reports the failure.
+    assert!(v.tick().is_err(), "the first failure should be reported");
+    // Every later tick while the object waits out its backoff must be quiet.
+    for n in 0..20 {
+        assert!(
+            v.tick().is_ok(),
+            "tick {n} after the backoff started reported the same failure again"
+        );
+    }
     std::fs::remove_dir_all(&root).ok();
 }

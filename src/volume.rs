@@ -1113,9 +1113,14 @@ impl Volume {
 
         // A store that is refusing everything gets a rest. Without this the
         // daemon re-attempts on every FLUSH, which a filesystem whose writes
-        // are failing sends about once a second -- 40 requests in 40 idle
-        // seconds, each one doomed, for as long as the client keeps trying.
-        // The data stays in the working copy and goes up on a later call.
+        // are failing sends about once a second. The data stays in the working
+        // copy and goes up on a later call.
+        //
+        // The rest is per object, so the request rate during an outage scales
+        // with how many objects are dirty: measured against a store answering
+        // 503, 56 requests in 30 s with about twenty of them, which is one
+        // every 10 s each. A global breaker would cap it at one window however
+        // many objects are waiting, and does not exist yet.
         if let Some(until) = self.backoff.get(&id).copied() {
             if until > std::time::Instant::now() {
                 anyhow::bail!(
@@ -1352,12 +1357,27 @@ impl Volume {
         if ready.is_empty() {
             return Ok(());
         }
+        // An object waiting out its backoff is not a new error: it is the
+        // same one from ten seconds ago. Returning it would make the caller
+        // log the identical sentence on every tick -- measured, 60 identical
+        // lines in 60 seconds with the store down, one per second, for as
+        // long as it stays down.
+        let now = std::time::Instant::now();
+        let mut first_error: Option<anyhow::Error> = None;
         for id in ready {
-            self.upload(id)?;
+            if self.backoff.get(&id).is_some_and(|until| *until > now) {
+                continue;
+            }
+            if let Err(e) = self.upload(id) {
+                first_error.get_or_insert(e);
+            }
         }
         self.save_meta()?;
         self.collect_garbage();
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn dirty_chunks(&self) -> usize {

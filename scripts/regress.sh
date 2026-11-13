@@ -81,7 +81,7 @@ run_step "systemd unit" /tmp/systemd-check.sh
 # The install steps from the README, as a reader would paste them.
 cp "$(dirname "$0")/../packaging/blobdev@.service" /tmp/blobdev@.service 2>/dev/null
 cp "$(dirname "$0")/../packaging/blobdev.conf.example" /tmp/blobdev.conf.example 2>/dev/null
-run_step "systemd deploy" /tmp/systemd-deploy.sh 3
+run_step "systemd deploy" /tmp/systemd-deploy.sh
 
 if [ "$QUICK" != "--quick" ]; then
   # A step that needs environment of its own.

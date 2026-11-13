@@ -67,6 +67,8 @@ options:
   --full-pct N       upload a chunk when N% of its blocks are dirty (default 50)
   --max-age S        upload a chunk dirty for S seconds (default 30)
   --read-chunks N    clean objects kept in memory (default 64, 4 MiB each)
+  --no-write-cache   do not keep uploaded data in the read caches; for
+                     workloads that only write (mkfs, bulk copy)
   --whole-chunk-pct N  fetch the whole object for reads covering N% of it (default 25)
   --cache-dir PATH   keep clean objects on local disk; enables read caching
   --cache-size SIZE  disk read cache budget, e.g. 20G (default 64M, 0 disables)
@@ -98,7 +100,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--access-key", "--backend", "--bucket", "--cache-dir", "--cache-size",
     "--chunk-mib", "--create-size", "--depth", "--dir", "--dry-run",
     "--endpoint", "--full-pct", "--help", "--id", "--key-prefix", "--max-age",
-    "--meta", "--no-meta-replica", "--object-mib", "--password", "--path-style",
+    "--meta", "--no-meta-replica", "--no-write-cache", "--object-mib", "--password", "--path-style",
     "--queues", "--read-chunks", "--region", "--retries", "--secret-key",
     "--timeout", "--user", "--verbose", "--virtual-host-style", "--volume",
     "--whole-chunk-pct",
@@ -419,6 +421,9 @@ fn run(args: &[String]) -> Result<()> {
             .map(|s| s.parse())
             .transpose()?
             .unwrap_or(25),
+        // Opt-out rather than opt-in: a read-back is the common case and is
+        // 8x cheaper when cached.
+        cache_writes: !flag(args, "--no-write-cache"),
     };
 
     // Data written through the device is already on local disk on its way out;

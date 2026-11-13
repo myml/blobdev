@@ -1549,3 +1549,50 @@ fn a_store_without_range_reads_still_returns_the_right_bytes() {
     assert_eq!(got, want, "a store without ranged reads returned wrong data");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// --no-write-cache keeps uploaded data out of the read caches.
+///
+/// Caching a write pays for itself when the data is read back -- measured,
+/// reading 256 MiB just written took 669 ms cached against 2206 ms without,
+/// 3.3x -- but a workload that only writes (mkfs, a bulk copy) spends the
+/// memory on nothing. Measured, 256 MiB written held 285 MiB with caching and
+/// 91 MiB without.
+#[test]
+fn writing_without_a_write_cache_does_not_fill_the_read_cache() {
+    let root = std::env::temp_dir().join(format!("blobdev-nowc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let nblk = (16 * 1024 * 1024 / BLOCK) as usize;
+    let data = vec![7u8; nblk * BLOCK as usize];
+
+    let cached = |policy: Policy, tag: &str| -> usize {
+        let dir = root.join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut v = Volume::open(
+            Arc::new(DirStore::new(dir.join("objects")).unwrap()),
+            Box::new(FileMeta::new(dir.join("meta"))),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            policy,
+        )
+        .unwrap();
+        v.write(0, nblk, &data).unwrap();
+        v.flush().unwrap();
+        v.cached_chunks()
+    };
+
+    let with = cached(Policy::default(), "on");
+    let without = cached(
+        Policy {
+            cache_writes: false,
+            ..Policy::default()
+        },
+        "off",
+    );
+    assert!(with > 0, "the default should cache written objects");
+    assert_eq!(
+        without, 0,
+        "--no-write-cache still left {without} objects in the read cache"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

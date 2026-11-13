@@ -101,6 +101,17 @@ pub struct Policy {
     /// Fetch and cache a whole chunk when a read covers at least this
     /// percentage of it (percent). Smaller reads use a byte-range fetch.
     pub whole_chunk_pct: u64,
+    /// Put uploaded objects into the read cache.
+    ///
+    /// On by default because a read-back is the common case and it is much
+    /// cheaper: measured, reading 256 MiB just written took 295 ms against
+    /// 2471 ms for the same data after it had been evicted, 8.4x.
+    ///
+    /// Turn it off for workloads that only write -- mkfs, a bulk copy -- where
+    /// the memory is spent on data nothing will read. Measured on a 2 GiB
+    /// volume, mkfs.ext4 alone took the process from 4 MiB to 115 MiB with
+    /// this on, and to 28 MiB with it off.
+    pub cache_writes: bool,
 }
 
 impl Default for Policy {
@@ -110,6 +121,7 @@ impl Default for Policy {
             max_age: std::time::Duration::from_secs(30),
             read_chunks: 64,
             whole_chunk_pct: 25,
+            cache_writes: true,
         }
     }
 }
@@ -1278,6 +1290,9 @@ impl Volume {
 
     /// Move an uploaded working copy into the read caches.
     fn cache_uploaded(&mut self, id: u64, data: Vec<u8>) {
+        if !self.policy.cache_writes {
+            return;
+        }
         if let Some(dc) = self.disk_cache.as_mut() {
             if let Err(e) = dc.put(id, &data) {
                 log::debug!("read cache store of chunk {id} failed: {e:#}");

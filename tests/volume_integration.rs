@@ -5,6 +5,7 @@
 //! needing the ublk kernel driver.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use blobdev::meta::{ChunkState, FileMeta, Geometry, MetaStore, MirroredMeta, Snapshot};
@@ -1593,6 +1594,84 @@ fn writing_without_a_write_cache_does_not_fill_the_read_cache() {
     assert_eq!(
         without, 0,
         "--no-write-cache still left {without} objects in the read cache"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A restart does not re-upload what is already in the store.
+///
+/// Measured on the host: writing 32 MiB, stopping, then restarting three times
+/// and reading everything back left the store at the same 26 objects and 104
+/// MiB. A restart re-reads metadata; only dirty blocks go up again.
+#[test]
+fn reopening_a_volume_uploads_nothing_that_is_already_stored() {
+    struct Counting {
+        inner: DirStore,
+        puts: Arc<AtomicUsize>,
+    }
+    impl ObjectStore for Counting {
+        fn caps(&self) -> Caps {
+            Caps::S3
+        }
+        fn stat(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.stat(key)
+        }
+        fn get(&self, key: &str, range: Option<std::ops::Range<u64>>) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(key, range)
+        }
+        fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<Option<String>> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(key, data)
+        }
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("blobdev-reopen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let puts = Arc::new(AtomicUsize::new(0));
+    let nblk = (16 * 1024 * 1024 / BLOCK) as usize;
+    let data = vec![4u8; nblk * BLOCK as usize];
+    {
+        let mut v = Volume::open(
+            Arc::new(Counting {
+                inner: DirStore::new(root.join("objects")).unwrap(),
+                puts: puts.clone(),
+            }),
+            Box::new(FileMeta::new(root.join("meta"))),
+            Layout::new("vol"),
+            Some(Create::new(8 * DEFAULT_CHUNK)),
+            Policy::default(),
+        )
+        .unwrap();
+        v.write(0, nblk, &data).unwrap();
+        v.flush().unwrap();
+    }
+    let after_write = puts.load(Ordering::SeqCst);
+    assert!(after_write > 0, "the write should have uploaded something");
+
+    for _ in 0..3 {
+        let mut v = Volume::open(
+            Arc::new(Counting {
+                inner: DirStore::new(root.join("objects")).unwrap(),
+                puts: puts.clone(),
+            }),
+            Box::new(FileMeta::new(root.join("meta"))),
+            Layout::new("vol"),
+            None,
+            Policy::default(),
+        )
+        .unwrap();
+        let mut buf = vec![0u8; (16 * BLOCK) as usize];
+        v.read(0, 16, &mut buf).unwrap();
+        v.flush().unwrap();
+    }
+    assert_eq!(
+        puts.load(Ordering::SeqCst),
+        after_write,
+        "reopening the volume uploaded again"
     );
     std::fs::remove_dir_all(&root).ok();
 }

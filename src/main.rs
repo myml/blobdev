@@ -730,7 +730,13 @@ fn status(_args: &[String]) -> Result<()> {
         );
     }
     println!();
-    println!("for dirty blocks, uploads and cache hit rates, read the daemon log");
+    // The line the daemon prints has dirty data, cache occupancy and upload
+    // totals; it has no hit rate, and saying it did would send someone
+    // looking for a number that is not there.
+    println!(
+        "for dirty data, cache occupancy and upload totals, read the daemon log:\
+         \n  journalctl -u blobdev@<volume> | grep -E 'dirty .* sent'"
+    );
     Ok(())
 }
 

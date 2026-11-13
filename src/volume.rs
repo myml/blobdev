@@ -1377,6 +1377,13 @@ impl Volume {
     /// Long runs have no other window into the process: these are the numbers
     /// that say whether it is keeping up (dirty blocks draining), whether the
     /// cache is working (hit rate, disk usage) and how much has been sent.
+    /// Whether there is anything to report: dirty data waiting, or uploads
+    /// that have happened. An idle volume prints nothing, so the interval can
+    /// be short enough to diagnose a slow period without filling the log.
+    pub fn has_activity(&self) -> bool {
+        !self.working.is_empty() || self.sent_bytes > 0 || self.reclaimed > 0
+    }
+
     pub fn summary(&self) -> String {
         let sent = self.sent_bytes;
         let (sent_disp, unit) = if sent >= 1 << 30 {

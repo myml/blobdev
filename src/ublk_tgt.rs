@@ -16,6 +16,12 @@ use anyhow::{Context, Result};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDesc, BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{UblkError, UblkFlags, UblkIORes};
+/// How often the daemon summarises what it is doing, in seconds.
+///
+/// Short enough to answer "why was that slow just now" while it is still
+/// happening. Idle volumes print nothing, so this does not turn into noise.
+const DEFAULT_SUMMARY_SECS: u64 = 60;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -183,8 +189,10 @@ fn spawn_maintenance(
         // A long run otherwise has no window into the daemon at all. One line
         // every few minutes says whether uploads are draining, whether the
         // cache is doing its job, and how much has been sent.
-        // Default ten minutes; BLOBDEV_SUMMARY_SECS overrides it, which is how
-        // the periodic line is exercised in tests without a long run.
+        // One minute: often enough to see a slow period while it is happening.
+        // Nothing is printed while the volume is idle (see has_activity), so
+        // the line rate follows the activity rather than the clock.
+        // BLOBDEV_SUMMARY_SECS overrides it.
         // A bad value is said out loud. Silently falling back to ten minutes
         // looks identical to the setting working, and the person who set it
         // is watching for a line that will never come.
@@ -193,16 +201,20 @@ fn spawn_maintenance(
                 Ok(n) if n > 0 => Duration::from_secs(n),
                 Ok(_) => {
                     log::warn!("BLOBDEV_SUMMARY_SECS={v} is not a positive number; using 600");
-                    Duration::from_secs(600)
+                    Duration::from_secs(DEFAULT_SUMMARY_SECS)
                 }
                 Err(_) => {
                     log::warn!("BLOBDEV_SUMMARY_SECS={v} is not a number; using 600");
-                    Duration::from_secs(600)
+                    Duration::from_secs(DEFAULT_SUMMARY_SECS)
                 }
             },
-            Err(_) => Duration::from_secs(600),
+            Err(_) => Duration::from_secs(DEFAULT_SUMMARY_SECS),
         };
         let mut last_summary = std::time::Instant::now();
+        // The last line printed, so an unchanged volume stays quiet. Counting
+        // activity was not enough: once anything had been sent, every interval
+        // printed the same sentence again.
+        let mut last_line = String::new();
         while !s.load(Ordering::SeqCst) {
             {
                 let (lock, cvar) = &*wake;
@@ -216,9 +228,20 @@ fn spawn_maintenance(
             if let Err(e) = v.tick() {
                 log::error!("upload: {e:#}");
             }
+            // Only when something happened. Printing an unchanged line every
+            // minute is what made a short interval unusable, which in turn is
+            // why the default was ten minutes -- and ten minutes is too coarse
+            // to answer "why was it slow just now". Silence while idle buys
+            // the resolution that matters.
             if last_summary.elapsed() >= summary_every {
                 last_summary = std::time::Instant::now();
-                log::info!("{}", v.summary());
+                if v.has_activity() {
+                    let line = v.summary();
+                    if line != last_line {
+                        last_line = line.clone();
+                        log::info!("{line}");
+                    }
+                }
             }
         }
     });

@@ -23,7 +23,13 @@ ExecStart=/usr/local/bin/blobdev run $BLOBDEV_ARGS
 # process ends immediately. The timeout is a backstop for a store that has
 # stopped answering, not the expected duration.
 KillSignal=SIGTERM
-TimeoutStopSec=120
+# Stopping uploads every dirty object first. With the default --timeout 60 and
+# --retries 4, one object can take 241 s in the worst case (four attempts plus
+# backoff), so 120 s was not enough to finish even one: the stop was SIGKILLed
+# mid-upload whenever the store was slow. The data survives -- it is still in
+# the working copy and the metadata -- but the stop is not clean and the next
+# start uploads it again. Raise this if you raise --retries or --timeout.
+TimeoutStopSec=300
 Restart=on-failure
 RestartSec=5s
 

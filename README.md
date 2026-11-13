@@ -294,11 +294,19 @@ systemd 单元与安装说明见 [`packaging/INSTALL.md`](packaging/INSTALL.md)�
 ```bash
 install -m 0755 target/release/blobdev /usr/local/bin/blobdev
 install -m 0644 packaging/blobdev@.service /etc/systemd/system/
+install -d /etc/blobdev
 cp packaging/blobdev.conf.example /etc/blobdev/data.conf   # 填后端与密钥
+chmod 600 /etc/blobdev/data.conf                        # 里面有密钥
 systemctl enable --now blobdev@data
 ```
 
-`SIGTERM` 会先把所有脏 chunk 上传完再退出，`TimeoutStopSec=300` 给足时间。
+`SIGTERM` 会先把所有脏 chunk 上传完再退出，`TimeoutStopSec=300` 给足时间——
+默认 `--timeout 60 --retries 4` 下**一个对象最坏要 241 秒**，所以这个值不能小。
+如果你调大了 `--retries` 或 `--timeout`，也把它一起调大。
+
+单元里还有 `Restart=on-failure`：守护进程异常退出时 systemd 会重新拉起它。
+`systemctl restart` 后设备会重建、数据不变；`systemctl stop` 之后
+`/sys/class/ublk-char` 里不会留下残留设备（都实测过）。
 
 ## 一致性
 

@@ -79,6 +79,8 @@ run_step "full volume" /tmp/volume-full.sh
 run_step "start-stop cycles" /tmp/churn.sh
 # A damaged metadata file must refuse, not start empty.
 run_step "metadata damage" /tmp/meta-damage.sh
+# Eight processes racing for one volume.
+run_step "concurrency" /tmp/concurrency.sh
   # Every flag refuses what it cannot mean.
   cp /root/blobdev/README.md /tmp/README.md 2>/dev/null; cp "$(dirname "$0")/README.md" /tmp/README.md 2>/dev/null
 run_step "argument handling" /tmp/args.sh

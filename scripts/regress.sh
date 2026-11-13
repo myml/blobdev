@@ -75,6 +75,8 @@ run_step "crash recovery" /tmp/crash-recovery.sh 2 8
 run_step "boundaries" /tmp/boundaries.sh dir
 # A full volume has to behave like a full disk.
 run_step "full volume" /tmp/volume-full.sh
+# Twenty stop-start cycles on one volume.
+run_step "start-stop cycles" /tmp/churn.sh
   # Every flag refuses what it cannot mean.
   cp /root/blobdev/README.md /tmp/README.md 2>/dev/null; cp "$(dirname "$0")/README.md" /tmp/README.md 2>/dev/null
 run_step "argument handling" /tmp/args.sh

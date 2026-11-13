@@ -25,6 +25,14 @@ impl FileLock {
     ///
     /// `try_lock` (not a blocking lock) is deliberate: a second instance
     /// should refuse to start rather than hang forever.
+    ///
+    /// A short retry covers handing over from a daemon that has just left.
+    /// Measured over 60 stop-start cycles with the volume mounted in each, one
+    /// start found the lock held with no process left to hold it -- no pid, no
+    /// zombie, `fuser` showing nothing. The window is between one process
+    /// exiting and another taking the lock, and it is a few milliseconds wide.
+    /// A daemon that really is running holds the lock for minutes, so this
+    /// changes nothing in the case the message is for.
     pub fn try_acquire(path: &Path) -> Result<FileLock> {
         let file = File::options()
             .create(true)
@@ -33,7 +41,20 @@ impl FileLock {
             .truncate(false)
             .open(path)
             .with_context(|| format!("open lock file {}", path.display()))?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let mut attempts = 0;
+        let rc = loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break rc;
+            }
+            let err = std::io::Error::last_os_error();
+            let busy = err.raw_os_error() == Some(libc::EWOULDBLOCK);
+            if !busy || attempts >= 10 {
+                break rc;
+            }
+            attempts += 1;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {

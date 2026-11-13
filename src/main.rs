@@ -745,9 +745,14 @@ fn stop(args: &[String]) -> Result<()> {
         .with_context(|| format!("stop device {id}"))?;
     log::info!("device {id} removed");
     // The device goes before the daemon does: it still has to flush, and it
-    // holds the metadata lock until it exits. With --meta the pid can be read
-    // out of the lock file, so stop can wait for it -- which is what a script
-    // that stops and starts again needs.
+    // holds the metadata lock until it exits. With --meta, wait until that lock
+    // can actually be taken.
+    //
+    // Waiting on the pid is not the same thing, which is how this first went
+    // wrong: a process disappears from /proc during its destructors, and
+    // FileLock::drop empties the file before it drops the flock. One start in
+    // twenty still collided with a lock whose owner was already gone. Taking
+    // the lock is the only test that answers the question being asked.
     //
     // Without --meta there is nothing here to wait on. pgrep is no good: this
     // command is also called blobdev, so it matches itself. Nor is /dev/ublkbN:
@@ -755,23 +760,30 @@ fn stop(args: &[String]) -> Result<()> {
     match arg(args, "--meta") {
         Some(meta) => {
             let lock = std::path::PathBuf::from(meta).with_extension("lock");
-            let pid = std::fs::read_to_string(&lock).ok().and_then(|text| {
-                text.replace("\\n", " ")
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|p| p.parse::<i32>().ok())
-            });
-            match pid {
-                Some(pid) if pid_alive(pid) => {
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(120);
-                    while pid_alive(pid) && std::time::Instant::now() < deadline {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut waited = false;
+            loop {
+                match blobdev::lockfile::FileLock::try_acquire(&lock) {
+                    // Acquired, so the previous holder is really done. Dropping
+                    // it here releases and clears the file.
+                    Ok(_) => break,
+                    Err(_) if std::time::Instant::now() >= deadline => {
+                        anyhow::bail!(
+                            "device {id} removed, but {} is still locked after 120 s",
+                            lock.display()
+                        );
+                    }
+                    Err(_) => {
+                        waited = true;
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                    log::info!("device {id} stopped, daemon {pid} gone");
                 }
-                _ => log::info!("device {id} removed; no daemon holds {}", lock.display()),
             }
+            log::info!(
+                "device {id} stopped, {} {}",
+                lock.display(),
+                if waited { "released" } else { "was already free" }
+            );
         }
         None => log::info!(
             "device {id} removed; the daemon exits once it has flushed (a second or \
@@ -780,21 +792,6 @@ fn stop(args: &[String]) -> Result<()> {
         ),
     }
     Ok(())
-}
-
-/// Whether `pid` exists and is not a zombie.
-///
-/// A daemon that has exited but has not been reaped still has a /proc entry;
-/// its state field is `Z` and it holds nothing.
-fn pid_alive(pid: i32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // The state is the first field after the parenthesised command name.
-    match stat.rsplit(')').next() {
-        Some(rest) => !rest.trim_start().starts_with('Z'),
-        None => true,
-    }
 }
 
 /// List the running ublk devices.

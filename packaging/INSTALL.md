@@ -36,6 +36,14 @@ install -d /etc/blobdev /var/lib/blobdev /var/cache/blobdev
 install -m 0644 packaging/blobdev@.service /etc/systemd/system/
 ```
 
+## Where files may live
+
+The unit runs with `ProtectSystem=full` and `ReadWritePaths=/var/lib/blobdev
+/var/cache/blobdev`. Point `--meta` or `--cache-dir` anywhere else and the
+service fails at step `NAMESPACE` before blobdev starts, with a message that
+does not say which directory was refused. Either keep them under those two
+paths or add yours to `ReadWritePaths`.
+
 ## Configure a volume
 
 ```bash

@@ -9,6 +9,12 @@ Wants=network-online.target
 # reader somewhere else entirely.
 After=systemd-modules-load.service
 Wants=systemd-modules-load.service
+# A start that fails for a configuration reason -- a missing EnvironmentFile, a
+# misspelled flag -- will fail the same way every time, so retrying it is waste.
+# These belong in [Unit]: put them in [Service] and systemd ignores them, which
+# is how the first version of this was written.
+StartLimitIntervalSec=60
+StartLimitBurst=2
 
 [Service]
 Type=simple
@@ -31,6 +37,11 @@ KillSignal=SIGTERM
 # start uploads it again. Raise this if you raise --retries or --timeout.
 TimeoutStopSec=300
 Restart=on-failure
+# A start that fails for a configuration reason -- a missing EnvironmentFile, a
+# misspelled flag -- will fail the same way every time. systemd's own default
+# limit only kicks in after five tries, which is 30+ seconds of retrying a typo
+# and a log full of restarts. Two tries inside a minute, then stay failed so
+# someone looks.
 RestartSec=5s
 
 # Sandboxing has to leave the device machinery alone.
@@ -62,6 +73,10 @@ RestartSec=5s
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
+# Where the metadata and the disk cache may live. A volume pointed anywhere
+# else -- --meta /srv/blob/my.meta, say -- fails at step NAMESPACE before
+# blobdev runs a single line, with a message that names neither the directory
+# nor the setting. Add the path here if you want it elsewhere.
 ReadWritePaths=/var/lib/blobdev /var/cache/blobdev
 NoNewPrivileges=true
 

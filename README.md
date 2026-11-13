@@ -465,6 +465,30 @@ mount /dev/ublkbN /mnt/data
   （约 1.9 次/秒）。目前没有全局熔断，脏对象很多时的请求量会相应更高。
 - `FLUSH` 的失败信息**不会**被抑制：ext4 必须知道写入没有落盘，否则会丢数据。
 
+## 元数据文件坏了怎么办
+
+元数据是唯一记录卷由哪些对象组成的文件。实测四种损坏，全部正确处理：
+
+| 损坏方式 | 启动时 |
+|---|---|
+| 被截断 | 拒绝，报 `metadata snapshot ... CRC` |
+| 某字节被改 | 拒绝，CRC 校验不通过 |
+| 被删掉 | **拒绝，并告诉你怎么恢复**（见下） |
+| 变成空文件 | 拒绝 |
+
+删掉元数据时的提示是：
+
+```
+volume data has no metadata. If the objects are still in the store, recover
+rather than recreate: a store that supports a metadata copy has one at
+data/meta, and `--no-meta-replica` turns that off. Passing a size creates an
+empty volume and does not touch the objects
+```
+
+**关键点：删掉元数据后不带 `--create-size` 启动不会建新卷**，它会停下来问你。
+带上 `--create-size` 才是明确表示「我要一个空卷」——此时**旧对象不会被删除**，
+仍然留在存储里，可以用 `blobdev gc` 看到它们成了孤儿。
+
 ## 卷写满时
 
 和设备写满一样，没有特殊处理（实测 7 项）：

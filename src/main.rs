@@ -744,6 +744,20 @@ fn stop(args: &[String]) -> Result<()> {
     ctrl.del_dev_async()
         .with_context(|| format!("stop device {id}"))?;
     log::info!("device {id} removed");
+    // Deleting the device makes the daemon flush and exit, which takes about
+    // a second -- and until it does, the metadata lock is still held. A script
+    // that stops and starts again immediately gets "another blobdev process
+    // is already using this volume", from the lock doing exactly its job.
+    // Wait for it here so stop means stopped.
+    // The device goes before the daemon does: it still has to flush, and it
+    // holds the metadata lock until it exits. There is no reliable way from
+    // here to wait for that -- the only handle is the pid in the lock file,
+    // which sits next to a metadata path this command is not given -- so say
+    // what the caller can rely on rather than pretending to wait.
+    log::info!(
+        "device {id} removed; the daemon exits once it has flushed (a second or \
+         so). Starting the same volume before then fails on the metadata lock"
+    );
     Ok(())
 }
 

@@ -363,16 +363,37 @@ ext4（和大多数文件系统）在遇到 I/O 错误后会把文件系统**重
 后端已经恢复也不会自己变回可写。这是内核的保护策略——它无法判断底层的错误
 是暂时的还是永久的。
 
-恢复步骤：
+恢复步骤（**实测走过**，见下）：
 
 ```bash
 umount /mnt/data
-blobdev inspect --volume data ...   # 可选：确认元数据和对象一致
+blobdev stop --id N                 # 停守护进程
+blobdev run ... --id N ...          # 用同样的参数重新起（同一个 --id）
 mount /dev/ublkbN /mnt/data
 ```
 
+**中间那两步不能省。** 后端掉线时 ext4 会中止 journal（内核日志里是
+`Aborting journal on device ublkbN-8`），之后 `umount` 看似成功，但
+`/dev/ublkbN` 这个块设备节点已经不存在了——`/sys/class/ublk-char/` 里还留着
+`ublkcN`，`mount` 只报 `Can't lookup blockdev`，光看这条信息完全不知道
+是设备没了还是盘坏了。
+
+实测（Nextcloud + 故障代理断开连接，32 MiB 数据）：
+
+| 步骤 | 结果 |
+|---|---|
+| 断网后写入 | **失败**（不会假装成功），`dmesg` 出现 `Aborting journal on device ublkbN-8` |
+| 断网后读 | 仍返回旧数据 |
+| 按旧文档只做 `umount` + `mount` | **`mount` 失败：`Can't lookup blockdev`** |
+| `umount` → 停守护进程 → 重起 → `mount` | **成功，`sha256` 与写入时一致，写入正常** |
+
+注意 `mount` 显示的还是 `rw`——**ext4 不会因为 journal 中止就把挂载点标成只读**，
+失败要等下一次写入才暴露。所以别用 `mount` 的输出判断卷是否健康，用写入或者
+`blobdev inspect`。
+
 卷本身没有损坏：脏块一直留在 daemon 的内存工作副本和元数据里，后端一恢复
-就会补传。实测宕机 8 MiB 未上传数据、恢复后卸载重挂，数据完好。
+就会补传。`blobdev inspect` 在不挂载的情况下也能看进度，例如
+`chunk 34: not uploaded yet, 1024 dirty block(s)`。
 
 ## 运行时的观测
 

@@ -68,6 +68,9 @@ run_step "e2e nextcloud" /tmp/nextcloud-e2e.sh
 
 echo "== failure modes"
 run_step "outage handling" /tmp/outage.sh
+# The recovery steps from the README, walked end to end: what the docs say
+# works has to keep working.
+run_step "outage recovery" /tmp/outage-recovery.sh
 run_step "crash recovery" /tmp/crash-recovery.sh 2 8
 run_step "boundaries" /tmp/boundaries.sh dir
   # Every flag refuses what it cannot mean.
